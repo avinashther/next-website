@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alpine Meadow</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #8fb9e3; }
+
+  /* The WebGL canvas: fullscreen, behind everything else (z-index 0). */
+  #scene {
+    position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    z-index: 0; opacity: 0; transition: opacity 1.8s ease;
+  }
+  #scene.ready { opacity: 1; }
+
+  /* Static fallback if WebGL / Three.js is unavailable. */
+  #fallback {
+    display: none; position: fixed; inset: 0; z-index: 0;
+    background: linear-gradient(#3f86dc 0%, #a9cdee 52%, #6e9f3c 53%, #3f7a24 100%);
+  }
+
+  /* Loading state. */
+  #loader {
+    position: fixed; inset: 0; z-index: 1000; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px; color: #fff;
+    font: 500 13px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+    letter-spacing: .18em; text-transform: uppercase;
+    background: linear-gradient(#4d8fdc 0%, #b4d3ee 58%, #6a9c3a 59%, #4a8a2a 100%);
+    transition: opacity 1.4s ease, visibility 1.4s;
+  }
+  #loader.done { opacity: 0; visibility: hidden; pointer-events: none; }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.35); border-top-color: #fff;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+  /* Reserved (invisible) slot for the fridge that will be added later.
+     Bottom-center, layered above the canvas. */
+  #fridge-slot {
+    position: fixed; left: 50%; bottom: 0; transform: translateX(-50%);
+    width: min(46vw, 420px); height: min(72vh, 660px);
+    z-index: 2; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="fallback"></div>
+<div id="fridge-slot" aria-hidden="true"></div>
+<div id="loader"><div class="spinner"></div><div>Loading meadow</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+'use strict';
+
+function showFallback(msg) {
+  document.getElementById('fallback').style.display = 'block';
+  document.getElementById('loader').classList.add('done');
+  if (msg) console.warn('[meadow] ' + msg);
+}
+if (typeof THREE === 'undefined') { showFallback('Three.js failed to load'); return; }
+
+/* ==========================================================================
+   0. CONFIG / QUALITY
+   ========================================================================== */
+const params = new URLSearchParams(location.search);
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = reduceMotion ? 0.3 : 1;            // global time scale for all motion
+const weakDevice = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent) ||
+                   Math.min(innerWidth, innerHeight) < 600 ||
+                   (navigator.hardwareConcurrency || 8) <= 4;
+const LOW = params.get('quality') ? params.get('quality') === 'low' : weakDevice;
+
+const Q = LOW ? {
+  grass: 26000, flowers: 6000, trees: 3200, cloudOct: 4, particles: 380,
+  birds: 4, butterflies: 7, maxDPR: 1.5, skyScale: 0.38, terrain: [150, 140], mtn: [120, 30], shadowRes: 64
+} : {
+  grass: 70000, flowers: 15000, trees: 9000, cloudOct: 5, particles: 900,
+  birds: 6, butterflies: 14, maxDPR: 2, skyScale: 0.5, terrain: [260, 220], mtn: [220, 44], shadowRes: 128
+};
+
+/* ==========================================================================
+   1. SMALL HELPERS + SHARED NOISE
+   ========================================================================== */
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const mix = (a, b, t) => a + (b - a) * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+// Deterministic PRNG so the scene looks the same every load.
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const rand = mulberry32(20261115);
+
+/* One 256x256 random lattice used by BOTH the GPU (texture lookups) and the CPU
+   (identical value-noise), so CPU-side placement / cloud shadows match the shaders. */
+const NOISE_N = 256;
+const noiseData = new Uint8Array(NOISE_N * NOISE_N * 4);
+for (let i = 0; i < noiseData.length; i++) noiseData[i] = Math.floor(rand() * 256);
+const noiseTex = new THREE.DataTexture(noiseData, NOISE_N, NOISE_N, THREE.RGBAFormat);
+noiseTex.magFilter = noiseTex.minFilter = THREE.NearestFilter;
+noiseTex.wrapS = noiseTex.wrapT = THREE.RepeatWrapping;
+noiseTex.generateMipmaps = false;
+noiseTex.needsUpdate = true;
+
+const lat = (ix, iy) => noiseData[(((iy & 255) << 8) + (ix & 255)) << 2] / 255;
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  return mix(mix(lat(ix, iy), lat(ix + 1, iy), ux), mix(lat(ix, iy + 1), lat(ix + 1, iy + 1), ux), uy);
+}
+function fbm(x, y, oct) {
+  let a = 0.5, s = 0;
+  for (let i = 0; i < oct; i++) { s += a * vnoise(x, y); const nx = x * 2.03 + 17.1, ny = y * 2.03 + 9.2; x = nx; y = ny; a *= 0.5; }
+  return s;
+}
+
+/* ==========================================================================
+   2. SCENE CONSTANTS
+   ========================================================================== */
+const CAM_POS = new THREE.Vector3(0, 1.35, 7);
+const CAM_PITCH = THREE.MathUtils.degToRad(3.2);
+
+// Sun: golden hour, ahead and to the right, fairly low.
+const SUN_AZ = THREE.MathUtils.degToRad(30), SUN_EL = THREE.MathUtils.degToRad(23);
+const SUN_DIR = new THREE.Vector3(
+  Math.sin(SUN_AZ) * Math.cos(SUN_EL), Math.sin(SUN_EL), -Math.cos(SUN_AZ) * Math.cos(SUN_EL)).normalize();
+
+// Short-grass clearing where the fridge will stand (bottom-centre of the screen).
+const CLEAR = { x: 0, z: 1.9, rx: 2.4, rz: 3.2 };
+
+// World region covered by the cloud-shadow texture (metres).
+const SH_X0 = -300, SH_Z0 = -540, SH_SIZE = 600;
+
+// Cloud layers (shared by the sky shader, the shadow map and the CPU sun-visibility estimate).
+const CLOUD_L1 = { alt: 1100, sc: 1 / 720,  cover: 0.53, seed: [3.1, 7.7],   step: 110 };
+const CLOUD_L2 = { alt: 2300, sc: 1 / 1300, cover: 0.56, seed: [41.3, 12.9], step: 160 };
+
+/* ==========================================================================
+   3. SHARED UNIFORMS + GLSL CHUNKS
+   ========================================================================== */
+const U = {
+  uTime:      { value: 0 },
+  uWind:      { value: 0.4 },
+  uGust:      { value: 0 },
+  uWindDir:   { value: new THREE.Vector2(0.94, -0.34).normalize() },
+  uGustPhase: { value: 0 },
+  uWindOff:   { value: new THREE.Vector2(0, 0) },     // accumulated wind displacement (particles, butterflies)
+  uCloudOff:  { value: new THREE.Vector2(0, 0) },
+  uMorph:     { value: 0 },
+  uSunDir:    { value: SUN_DIR.clone() },
+  uHazeCol:   { value: new THREE.Color(0.69, 0.81, 0.94) },
+  uHazeDen:   { value: 0.00036 },
+  uNoise:     { value: noiseTex },
+  uShadow:    { value: null },                        // set after the shadow texture exists
+  uClear:     { value: new THREE.Vector4(CLEAR.x, CLEAR.z, CLEAR.rx, CLEAR.rz) }
+};
+
+const GLSL_COMMON = `
+#define CLOUD_OCT ${Q.cloudOct}
+uniform float uTime;
+uniform float uWind;
+uniform float uGust;
+uniform vec2  uWindDir;
+uniform float uGustPhase;
+uniform vec2  uWindOff;
+uniform vec2  uCloudOff;
+uniform float uMorph;
+uniform vec3  uSunDir;
+uniform vec3  uHazeCol;
+uniform float uHazeDen;
+uniform vec4  uClear;
+uniform sampler2D uNoise;
+uniform sampler2D uShadow;
+
+// ---- value noise from the shared lattice texture (mirrored exactly on the CPU) ----
+float n2(vec2 i){ return texture2D(uNoise, (mod(i, 256.0) + 0.5) / 256.0).r; }
+float vn(vec2 p){
+  vec2 i = floor(p); vec2 f = fract(p); vec2 u = f*f*(3.0 - 2.0*f);
+  return mix(mix(n2(i), n2(i + vec2(1.0,0.0)), u.x),
+             mix(n2(i + vec2(0.0,1.0)), n2(i + vec2(1.0,1.0)), u.x), u.y);
+}
+float fbm(vec2 p){
+  float a = 0.5; float s = 0.0;
+  for (int i = 0; i < CLOUD_OCT; i++) { s += a * vn(p); p = p * 2.03 + vec2(17.1, 9.2); a *= 0.5; }
+  return s;
+}
+// Cloud density on a horizontal plane; slowly morphs (uMorph) and drifts (uCloudOff).
+float cloudAt(vec2 P, float sc, float cover, vec2 seed, float spd){
+  vec2 q = (P + uCloudOff * spd) * sc + seed;       // spd = per-layer drift speed (parallax)
+  q += 0.7 * vec2(vn(q*0.6 + vec2(uMorph)), vn(q*0.6 + vec2(31.7 - uMorph))) - 0.35;
+  return smoothstep(cover, cover + 0.15, fbm(q));
+}
+
+// Cloud shadow cast on the ground (texture refreshed on the CPU ~10x per second).
+float shadowAt(vec2 P){
+  return texture2D(uShadow, (P - vec2(${SH_X0.toFixed(1)}, ${SH_Z0.toFixed(1)})) / ${SH_SIZE.toFixed(1)}).r;
+}
+
+// Depth haze: distance fog that tints far things blue, and warm toward the sun.
+vec3 hazeApply(vec3 col, vec3 wp, float boost){
+  vec3 v = wp - cameraPosition; float dist = length(v); vec3 vd = v / max(dist, 0.001);
+  float sunAmt = pow(max(dot(vd, uSunDir), 0.0), 5.0);
+  vec3 hc = mix(uHazeCol, vec3(1.0, 0.86, 0.66), sunAmt * 0.5);
+  float f = 1.0 - exp(-dist * uHazeDen * boost);
+  return mix(col, hc, clamp(f, 0.0, 0.94));
+}
+`;
+
+// Global wind field: slow breeze + large travelling gust bands + mid swells. Returns (dx, dz, bandValue).
+const GLSL_WIND = `
+vec3 windAt(vec2 P){
+  vec2 dir = uWindDir; vec2 perp = vec2(-dir.y, dir.x);
+  float along = dot(P, dir); float across = dot(P, perp);
+  float wave  = vn(vec2(along*0.018 - uGustPhase*0.9, across*0.006));
+  float swell = vn(vec2(along*0.07  - uGustPhase*1.6, across*0.05 + 3.1));
+  float s = uWind*(0.35 + 0.9*wave) + uGust*smoothstep(0.30, 0.80, wave)*(0.6 + 0.8*swell) + 0.12*uWind*swell;
+  return vec3(dir * s, wave);
+}
+`;
+
+/* ==========================================================================
+   4. WORLD HEIGHT FIELD (CPU side; used for mesh building + instance placement)
+   ========================================================================== */
+// Half-width of the flat meadow floor; narrows with distance so the valley closes in.
+const edgeW = d => 95 - 55 * smoothstep(0, 520, d);
+
+function terrainH(x, z) {
+  const d = -z, ax = Math.abs(x), edge = edgeW(d), s = Math.max(0, ax - edge);
+  const amp = 55 + 0.22 * clamp(d, 0, 900);
+  let h = (1 - Math.exp(-s * 0.011)) * amp;                                            // rolling side hills
+  h += (fbm(x * 0.004 + 11, z * 0.004 + 5, 4) - 0.45) * 70 * smoothstep(15, 220, s);   // ridges on the slopes
+  h += (fbm(x * 0.02 + 2, z * 0.02 + 8, 3) - 0.45) * 2.2 * (1 - smoothstep(0, 120, s)); // gentle meadow undulation
+  h += smoothstep(250, 1150, d) * (60 + 80 * fbm(x * 0.003 + 40, z * 0.003 + 1, 3)) *
+       (0.35 + 0.65 * smoothstep(0, 350, ax));                                         // low back hills, valley stays open
+  return h;
+}
+
+// 0..1 "how forested" a spot is (belt along the slopes, thinning above the tree line, with glades).
+function forestMask(x, z, h) {
+  const d = -z, edge = edgeW(d), s = Math.max(0, Math.abs(x) - edge);
+  const belt = smoothstep(3, 28, s);
+  const back = smoothstep(30, 90, h) * smoothstep(300, 700, d);
+  const line = 1 - smoothstep(105, 150, h);
+  const patch = smoothstep(0.34, 0.52, fbm(x * 0.005 + 3, z * 0.005 + 9, 3));
+  return clamp(Math.max(belt, back) * line * (0.45 + 0.55 * patch), 0, 1);
+}
+
+/* ==========================================================================
+   5. MATERIAL / GEOMETRY HELPERS
+   ========================================================================== */
+function makeMaterial(vs, fs, extra, opts) {
+  return new THREE.ShaderMaterial(Object.assign({
+    uniforms: Object.assign({}, U, extra || {}),     // shared uniform objects => one update drives everything
+    vertexShader: GLSL_COMMON + GLSL_WIND + vs,
+    fragmentShader: GLSL_COMMON + fs
+  }, opts || {}));
+}
+function instancedFrom(base, count) {
+  const g = new THREE.InstancedBufferGeometry().copy(base);
+  g.instanceCount = count;
+  return g;
+}
+const addInst = (g, name, arr, size) => g.setAttribute(name, new THREE.InstancedBufferAttribute(arr, size));
+
+/* ==========================================================================
+   6. FAR MOUNTAIN RANGES (snow patches, atmospheric perspective)
+   ========================================================================== */
+function mountainH(x, z, zc, layer) {
+  const s = layer ? 31.7 : 0, f = 0.00085;
+  let a = 0.55, fr = f, sum = 0;
+  for (let i = 0; i < 5; i++) {
+    const n = 1 - Math.abs(2 * vnoise(x * fr + s + 5.3 * i, z * fr + s * 0.7) - 1);   // ridged noise = sharp crests
+    sum += a * n * n; fr *= 2.07; a *= 0.48;
+  }
+  const env = 0.55 + 0.9 * (fbm(x * 0.00045 + s, 0.5 + s, 3) - 0.3);
+  const edge = 1 - smoothstep(3000, 4200, Math.abs(x));
+  const frac = (zc + 450 - z) / 900;                                                  // 0 front .. 1 back
+  const depth = smoothstep(0.0, 0.5, frac) * (1 - 0.35 * smoothstep(0.75, 1, frac));
+  return sum * (layer ? 980 : 820) * clamp(env, 0.3, 1.3) * edge * depth;
+}
+
+function buildMountains(zc, layer, boost) {
+  const [NX, NZ] = Q.mtn, vc = (NX + 1) * (NZ + 1);
+  const pos = new Float32Array(vc * 3), col = new Float32Array(vc * 3);
+  let k = 0;
+  for (let j = 0; j <= NZ; j++) {
+    const z = zc + 450 - (j / NZ) * 900;
+    for (let i = 0; i <= NX; i++) {
+      const x = (i / NX * 2 - 1) * 4200;
+      pos[k++] = x; pos[k++] = mountainH(x, z, zc, layer); pos[k++] = z;
+    }
+  }
+  const idx = [];
+  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++) {
+    const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1;
+    idx.push(a, b, c, b, d, c);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  const nor = geo.attributes.normal.array, amp = layer ? 980 : 820;
+  for (let v = 0; v < vc; v++) {
+    const x = pos[v * 3], h = pos[v * 3 + 1], z = pos[v * 3 + 2], ny = nor[v * 3 + 1];
+    const rockMix = vnoise(x * 0.004, z * 0.004);
+    let r = mix(0.36, 0.30, rockMix), g = mix(0.36, 0.27, rockMix), b = mix(0.42, 0.28, rockMix);
+    const lowMix = 1 - smoothstep(90, 280, h);                           // dark conifer belt at the foot
+    r = mix(r, 0.09, lowMix); g = mix(g, 0.17, lowMix); b = mix(b, 0.12, lowMix);
+    const t = h / amp + (vnoise(x * 0.011, z * 0.011) - 0.5) * 0.22;
+    const snow = smoothstep(0.30, 0.42, t) * smoothstep(0.30, 0.65, ny);  // snow patches, less on steep faces
+    r = mix(r, 0.94, snow); g = mix(g, 0.96, snow); b = mix(b, 1.0, snow);
+    col[v * 3] = r; col[v * 3 + 1] = g; col[v * 3 + 2] = b;
+  }
+  geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+  const mat = makeMaterial(`
+    attribute vec3 aColor; varying vec3 vCol; varying vec3 vWorld; varying vec3 vN;
+    void main(){ vCol = aColor; vN = normal; vWorld = position;
+      gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0); }
+  `, `
+    uniform float uBoost; varying vec3 vCol; varying vec3 vWorld; varying vec3 vN;
+    void main(){
+      vec3 N = normalize(vN);
+      float ndl = dot(N, uSunDir);
+      vec3 light = vec3(0.44,0.55,0.76)*0.7 + vec3(1.0,0.88,0.66)*max(ndl*0.8 + 0.2, 0.0)*1.1;
+      vec3 col = vCol * light * (0.9 + 0.2*vn(vWorld.xz*0.004));
+      gl_FragColor = vec4(hazeApply(col, vWorld, uBoost), 1.0);
+    }
+  `, { uBoost: { value: boost } });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   7. TERRAIN: meadow floor + rolling hills (shader-painted: grass, flower speckle, forest, rock)
+   ========================================================================== */
+function buildTerrain() {
+  const [NX, NZ] = Q.terrain, vc = (NX + 1) * (NZ + 1);
+  const pos = new Float32Array(vc * 3), forest = new Float32Array(vc);
+  let k = 0, f = 0;
+  for (let j = 0; j <= NZ; j++) {
+    const z = 40 - Math.pow(j / NZ, 2) * 1560;                 // dense near the camera, sparse far away
+    for (let i = 0; i <= NX; i++) {
+      const u = i / NX * 2 - 1, x = Math.sign(u) * u * u * 2400;
+      const h = terrainH(x, z);
+      pos[k++] = x; pos[k++] = h; pos[k++] = z; forest[f++] = forestMask(x, z, h);
+    }
+  }
+  const idx = vc > 65535 ? new Uint32Array(NX * NZ * 6) : new Uint16Array(NX * NZ * 6);
+  let q = 0;
+  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++) {
+    const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1;
+    idx[q++] = a; idx[q++] = b; idx[q++] = c; idx[q++] = b; idx[q++] = d; idx[q++] = c;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aForest', new THREE.BufferAttribute(forest, 1));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+
+  const mat = makeMaterial(`
+    attribute float aForest; varying vec3 vWorld; varying vec3 vN; varying float vForest;
+    void main(){ vWorld = position; vN = normal; vForest = aForest;
+      gl_Position = projectionMatrix * viewMatrix * vec4(position, 1.0); }
+  `, `
+    varying vec3 vWorld; varying vec3 vN; varying float vForest;
+    void main(){
+      vec2 P = vWorld.xz; float h = vWorld.y;
+      float dist = length(vWorld - cameraPosition);
+      vec3 N = normalize(vN);
+
+      // meadow base colour: large patches + fine grain (grain fades with distance => smooth far green)
+      float p1 = vn(P*0.03), p2 = vn(P*0.4 + 7.0), fine = vn(P*3.1);
+      vec3 col = mix(vec3(0.12,0.29,0.05), vec3(0.30,0.52,0.10), clamp(p1*0.9 + p2*0.35 - 0.1, 0.0, 1.0));
+      col *= 0.9 + 0.2*fine*(1.0 - smoothstep(10.0, 90.0, dist));
+
+      // forest belt on the slopes
+      float forest = clamp(vForest * (0.75 + 0.5*vn(P*0.22)), 0.0, 1.0);
+      vec3 fcol = vec3(0.030,0.115,0.055) * (0.75 + 0.6*vn(P*1.1));
+      col = mix(col, fcol, forest);
+
+      // daisy speckle: dense up close, thinning into smooth green far away
+      float fdist = 1.0 - smoothstep(30.0, 170.0, dist);
+      float cluster = 0.55 + 0.45*smoothstep(0.3, 0.7, vn(P*0.07 + 3.0));
+      vec2 g = P*1.5; vec2 gi = floor(g); vec2 gf = fract(g);
+      vec2 jit = vec2(n2(gi + 13.0), n2(gi + 57.0))*0.6 + 0.2;
+      float fl = smoothstep(0.15, 0.06, length(gf - jit)) * step(1.0 - 0.55*cluster*fdist, n2(gi));
+      fl *= (1.0 - forest) * smoothstep(0.7, 0.85, N.y);
+      col = mix(col, vec3(0.96,0.95,0.88), fl*0.9);
+
+      // alpine pasture above the tree line, bare rock higher / steeper
+      float alpine = smoothstep(95.0, 170.0, h) * (1.0 - forest);
+      col = mix(col, vec3(0.36,0.48,0.17), alpine*0.7);
+      float rock = clamp(smoothstep(250.0, 340.0, h) + (1.0 - smoothstep(0.62, 0.82, N.y))*0.8, 0.0, 1.0) * (1.0 - forest*0.8);
+      col = mix(col, vec3(0.42,0.40,0.38)*(0.8 + 0.4*vn(P*0.5)), rock);
+
+      // golden sunlight + cool sky fill + moving cloud shadows
+      float sh = shadowAt(P) * (1.0 - smoothstep(350.0, 560.0, dist));
+      float ndl = dot(N, uSunDir);
+      vec3 light = vec3(0.44,0.57,0.78)*0.62 + vec3(1.0,0.86,0.62)*max(ndl*0.85 + 0.15, 0.0)*1.15*(1.0 - 0.72*sh);
+      col *= light;
+      gl_FragColor = vec4(hazeApply(col, vWorld, 1.0), 1.0);
+    }
+  `);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   8. CONIFER FOREST (instanced, 3-tier cones, swaying with the wind)
+   ========================================================================== */
+function treeGeometry() {
+  const seg = 8, tiers = [{ y0: 0.04, y1: 0.50, r: 1.0 }, { y0: 0.26, y1: 0.76, r: 0.74 }, { y0: 0.50, y1: 1.0, r: 0.48 }];
+  const pos = [], nor = [], tt = [], idx = [];
+  tiers.forEach(t => {
+    const base = pos.length / 3;
+    for (let s = 0; s <= seg; s++) {                                   // apex (one per segment => smooth shading)
+      pos.push(0, t.y1, 0); nor.push(0, 1, 0); tt.push(1);
+    }
+    for (let s = 0; s <= seg; s++) {
+      const a = s / seg * Math.PI * 2, c = Math.cos(a), sn = Math.sin(a);
+      pos.push(c * t.r * 0.5, t.y0, sn * t.r * 0.5);
+      const l = Math.hypot(c, 0.7, sn); nor.push(c / l, 0.7 / l, sn / l); tt.push(0);
+    }
+    for (let s = 0; s < seg; s++) idx.push(base + s, base + seg + 1 + s, base + seg + 2 + s);
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('aTierT', new THREE.Float32BufferAttribute(tt, 1));
+  g.setIndex(idx);
+  return g;
+}
+
+function buildForest() {
+  const N = Q.trees, off = new Float32Array(N * 3), scl = new Float32Array(N * 2), tint = new Float32Array(N);
+  let n = 0, tries = 0;
+  while (n < N && tries < N * 60) {
+    tries++;
+    const d = 6 + 1250 * Math.pow(rand(), 2.2), z = -d, edge = edgeW(d);
+    const x = rand() < 0.85
+      ? (rand() < 0.5 ? -1 : 1) * (edge + (-Math.log(rand() + 1e-4)) * 160 * (0.4 + d / 900))
+      : (rand() - 0.5) * 2 * (300 + d * 0.5);
+    const h = terrainH(x, z), m = forestMask(x, z, h);
+    if (rand() > m * m * 1.1) continue;
+    const ht = (8 + rand() * 9) * (1 + d / 650);                       // far trees a bit larger to hide gaps
+    off[n * 3] = x; off[n * 3 + 1] = h - 0.4; off[n * 3 + 2] = z;
+    scl[n * 2] = ht; scl[n * 2 + 1] = ht * (0.30 + rand() * 0.12);
+    tint[n] = rand(); n++;
+  }
+  const geo = instancedFrom(treeGeometry(), n);
+  addInst(geo, 'aOffset', off, 3); addInst(geo, 'aScale', scl, 2); addInst(geo, 'aTint', tint, 1);
+  const mat = makeMaterial(`
+    attribute vec3 aOffset; attribute vec2 aScale; attribute float aTint; attribute float aTierT;
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){
+      vec3 wp = aOffset + vec3(position.x*aScale.y, position.y*aScale.x, position.z*aScale.y);
+      vec3 w = windAt(aOffset.xz);
+      wp.xz += w.xy * 0.045 * aScale.x * position.y * position.y;       // tops sway with the gusts
+      float lit = clamp(dot(normalize(normal), uSunDir)*0.55 + 0.5, 0.0, 1.0);
+      vec3 dark   = mix(vec3(0.020,0.075,0.045), vec3(0.035,0.10,0.05), aTint);
+      vec3 bright = mix(vec3(0.10,0.25,0.10),   vec3(0.17,0.32,0.11), aTint);
+      vCol = mix(dark, bright, lit*lit*(0.35 + 0.65*aTierT));
+      vCol *= (0.55 + 0.45*aTierT) * (0.6 + 0.4*smoothstep(0.0, 0.5, position.y));
+      float dist = length(aOffset - cameraPosition);
+      vCol *= 1.0 - 0.55*shadowAt(aOffset.xz)*(1.0 - smoothstep(350.0, 560.0, dist));
+      vWorld = wp;
+      gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+    }
+  `, `
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){ gl_FragColor = vec4(hazeApply(vCol, vWorld, 1.0), 1.0); }
+  `, {}, { side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   9. GRASS: 50k+ instanced blades, wind in the vertex shader
+   ========================================================================== */
+function buildGrass() {
+  // One blade: 4 rows of 2 verts + a tip. Width/taper/bend are all done in the shader.
+  const bp = [], bi = [];
+  [0, 0.3, 0.6, 0.85].forEach(y => bp.push(-0.5, y, 0, 0.5, y, 0));
+  bp.push(0, 1, 0);
+  for (let r = 0; r < 3; r++) { const a = r * 2; bi.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  bi.push(6, 7, 8);
+  const base = new THREE.BufferGeometry();
+  base.setAttribute('position', new THREE.Float32BufferAttribute(bp, 3));
+  base.setIndex(bi);
+
+  const N = Q.grass;
+  const off = new Float32Array(N * 3), shape = new Float32Array(N * 4), lean = new Float32Array(N * 2), tint = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const dd = Math.pow(rand(), 2.3) * 95;                      // far more blades near the camera
+    const z = 4.4 - dd, hw = 1.1 * (7 - z) + 5;
+    const x = (rand() * 2 - 1) * hw;
+    const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
+    off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
+    shape[i * 4]     = (0.30 + rand() * 0.34) * (0.8 + 0.55 * patch);              // height
+    shape[i * 4 + 1] = (0.032 + rand() * 0.026) * (1 + (7 - z) * 0.02);            // width (wider far away => no shimmer)
+    shape[i * 4 + 2] = rand() * Math.PI;                                           // yaw
+    shape[i * 4 + 3] = rand();                                                     // phase
+    const la = rand() * Math.PI * 2, lm = 0.04 + rand() * 0.16;
+    lean[i * 2] = Math.cos(la) * lm; lean[i * 2 + 1] = Math.sin(la) * lm;
+    tint[i] = clamp(0.3 * rand() + 0.7 * patch, 0, 1);
+  }
+  const geo = instancedFrom(base, N);
+  addInst(geo, 'aOffset', off, 3); addInst(geo, 'aShape', shape, 4); addInst(geo, 'aLean', lean, 2); addInst(geo, 'aTint', tint, 1);
+
+  const mat = makeMaterial(`
+    attribute vec3 aOffset; attribute vec4 aShape; attribute vec2 aLean; attribute float aTint;
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){
+      vec2 P = aOffset.xz;
+      float k  = smoothstep(0.55, 1.25, length((P - uClear.xy) / uClear.zw));   // short grass in the fridge clearing
+      float h  = aShape.x * mix(0.16, 1.0, k);
+      float y  = position.y;
+      float wid = aShape.y * (1.0 - y*y*0.9) * mix(0.8, 1.0, k);
+      vec2 across = vec2(cos(aShape.z), sin(aShape.z)) * position.x * wid;
+      vec2 bend = aLean * h * y * y;                                             // static lean
+
+      vec3 w = windAt(P);                                                        // shared wind field
+      vec2 wd = w.xy * (0.5 * h) * y * y;
+      float fl = sin(uTime*(7.0 + aShape.w*6.0) + aShape.w*40.0 + dot(P, vec2(0.7, 0.3)));  // small random flutter
+      vec2 perp = vec2(-uWindDir.y, uWindDir.x);
+      wd += (perp*fl + uWindDir*sin(fl*3.0 + aShape.w*10.0)) * 0.03 * h * y * (0.25 + uWind*0.9 + uGust*0.5);
+      float drop = dot(wd, wd) * 0.5 / max(h, 0.05) * y;                         // bent blades get a bit shorter
+
+      vec3 wp = vec3(P.x + across.x + bend.x + wd.x, aOffset.y + y*h - drop, P.y + across.y + bend.y + wd.y);
+
+      vec3 base = mix(vec3(0.045,0.17,0.03), vec3(0.10,0.28,0.04), aTint);
+      vec3 tip  = mix(vec3(0.38,0.62,0.12), vec3(0.62,0.74,0.20), aTint);
+      vec3 col = mix(base, tip, pow(y, 0.8));
+      col *= 0.40 + 0.60*pow(y, 0.6);                                            // cheap ambient occlusion
+      float sh = shadowAt(P);
+      col *= 1.0 - 0.48*sh;                                                      // moving cloud shadows
+      vec3 vd = normalize(wp - cameraPosition);
+      float back = pow(max(dot(vd, uSunDir), 0.0), 3.0);
+      col += vec3(0.9, 0.75, 0.25) * back * 0.30 * y * (1.0 - 0.7*sh);           // sunlight shining through the blades
+      vCol = col; vWorld = wp;
+      gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+    }
+  `, `
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){ gl_FragColor = vec4(hazeApply(vCol, vWorld, 1.0), 1.0); }
+  `, {}, { side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   10. DAISIES: stem + 10 petals + yellow centre, nodding in the same wind field
+   ========================================================================== */
+function buildFlowers() {
+  const pos = [], part = [], idx = [];
+  // stem (part 0)
+  [0, 0.33, 0.66, 1].forEach(t => { pos.push(-0.5, t, 0, 0.5, t, 0); part.push(0, 0); });
+  for (let r = 0; r < 3; r++) { const a = r * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  // centre disc (part 2)
+  const c0 = pos.length / 3;
+  pos.push(0, 0, 0); part.push(2);
+  for (let s = 0; s < 8; s++) { const a = s / 8 * Math.PI * 2; pos.push(Math.cos(a) * 0.27, Math.sin(a) * 0.27, 0); part.push(2); }
+  for (let s = 0; s < 8; s++) idx.push(c0, c0 + 1 + s, c0 + 1 + (s + 1) % 8);
+  // petals (part 1)
+  for (let p = 0; p < 10; p++) {
+    const a = p / 10 * Math.PI * 2, b = pos.length / 3;
+    pos.push(Math.cos(a - 0.30) * 0.24, Math.sin(a - 0.30) * 0.24, 0,
+             Math.cos(a + 0.30) * 0.24, Math.sin(a + 0.30) * 0.24, 0,
+             Math.cos(a), Math.sin(a), 0);
+    part.push(1, 1, 1); idx.push(b, b + 1, b + 2);
+  }
+  const base = new THREE.BufferGeometry();
+  base.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  base.setAttribute('aPart', new THREE.Float32BufferAttribute(part, 1));
+  base.setIndex(idx);
+
+  const N = Q.flowers;
+  const off = new Float32Array(N * 3), prm = new Float32Array(N * 4), tint = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const dd = Math.pow(rand(), 2.0) * 90;
+    const z = 4.4 - dd, hw = 1.1 * (7 - z) + 5, x = (rand() * 2 - 1) * hw;
+    const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
+    off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
+    prm[i * 4]     = (0.36 + rand() * 0.38) * (0.85 + 0.4 * patch);   // stem height
+    prm[i * 4 + 1] = 0.036 + rand() * 0.018;                           // head radius
+    prm[i * 4 + 2] = rand();                                           // phase
+    prm[i * 4 + 3] = 0.7 + rand() * 0.6;                               // stiffness
+    tint[i] = rand();
+  }
+  const geo = instancedFrom(base, N);
+  addInst(geo, 'aOffset', off, 3); addInst(geo, 'aParam', prm, 4); addInst(geo, 'aTint', tint, 1);
+
+  const mat = makeMaterial(`
+    attribute vec3 aOffset; attribute vec4 aParam; attribute float aTint; attribute float aPart;
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){
+      vec2 P = aOffset.xz;
+      float k = smoothstep(0.55, 1.25, length((P - uClear.xy) / uClear.zw));
+      float H = aParam.x * mix(0.2, 1.0, k);
+      vec3 w = windAt(P);                                                        // same wind, different stiffness/phase
+      vec2 wd = w.xy * 0.42 * H / aParam.w;
+      float sway = sin(uTime*(1.8 + aParam.z*1.4) + aParam.z*30.0 + dot(P, vec2(0.4, 0.2))) * 0.03 * H * (0.3 + uWind*0.8 + uGust*0.4);
+      wd += vec2(-uWindDir.y, uWindDir.x) * sway;
+      float t = aPart < 0.5 ? position.y : 1.0;
+      float drop = dot(wd, wd) * 0.5 / max(H, 0.05) * t*t;
+      vec3 stem = vec3(P.x + wd.x*t*t, aOffset.y + t*H - drop, P.y + wd.y*t*t);
+      vec3 wp = stem; vec3 col;
+      if (aPart < 0.5) {
+        wp.x += position.x * 0.012 * (1.0 - 0.4*t);
+        col = mix(vec3(0.06,0.20,0.03), vec3(0.18,0.40,0.07), t) * (0.5 + 0.5*t);
+      } else {
+        float a = aParam.z * 6.2831;
+        // heads face up and toward the viewer, and nod with the wind
+        vec3 N = normalize(vec3(sin(a)*0.45 + w.x*0.12, 1.0, 0.7 + cos(a)*0.35 + w.y*0.12));
+        vec3 T = normalize(cross(vec3(0.0, 1.0, 0.0), N));
+        vec3 B = cross(N, T);
+        float dist = length(stem - cameraPosition);
+        float size = aParam.y * (1.0 + smoothstep(8.0, 70.0, dist)*1.1) * mix(0.6, 1.0, k);  // slightly larger far away
+        wp = stem + (T*position.x + B*position.y)*size + N*(aPart > 1.5 ? 0.004 : 0.0);
+        vec3 vd = normalize(wp - cameraPosition);
+        float back = pow(max(dot(vd, uSunDir), 0.0), 3.0);
+        if (aPart < 1.5) {
+          float r = length(position.xy);
+          col = mix(vec3(0.80,0.86,0.72), vec3(1.0,0.99,0.96), smoothstep(0.15, 0.6, r)) * (0.9 + 0.1*aTint);
+          col *= 0.8 + 0.25*abs(dot(N, uSunDir));
+          col += vec3(1.0, 0.82, 0.45) * back * 0.22;                            // petals glow when backlit
+        } else {
+          col = vec3(0.98, 0.73, 0.07) * (0.85 + 0.2*aTint);
+          col += vec3(0.5, 0.35, 0.0) * back * 0.15;
+        }
+      }
+      col *= 1.0 - 0.45*shadowAt(P);
+      vCol = col; vWorld = wp;
+      gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+    }
+  `, `
+    varying vec3 vCol; varying vec3 vWorld;
+    void main(){ gl_FragColor = vec4(hazeApply(vCol, vWorld, 1.0), 1.0); }
+  `, {}, { side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   11. FLOATING PARTICLES: dust motes, pollen and a few drifting seeds (all wind-driven)
+   ========================================================================== */
+function buildParticles() {
+  const N = Q.particles, pos = new Float32Array(N * 3), seed = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    pos[i * 3] = rand() * 70; pos[i * 3 + 1] = Math.pow(rand(), 1.6) * 14; pos[i * 3 + 2] = rand() * 110;
+    const r = rand(), type = r > 0.96 ? 1 : 0;
+    seed[i * 4] = rand();                                            // phase
+    seed[i * 4 + 1] = type ? 0.10 + rand() * 0.05 : 0.016 + rand() * 0.03;   // size (m)
+    seed[i * 4 + 2] = type;
+    seed[i * 4 + 3] = rand();                                        // speed multiplier
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 4));
+  const mat = makeMaterial(`
+    attribute vec4 aSeed; uniform float uScale; varying float vA; varying float vType;
+    void main(){
+      vec3 box = vec3(70.0, 14.0, 110.0);
+      vec3 p = position;
+      p.xz += uWindOff * (0.5 + aSeed.w*0.9);                                    // carried along by the wind
+      p.y  += sin(uTime*(0.4 + aSeed.w*0.5) + aSeed.x*20.0) * 0.5;
+      p.x  += sin(uTime*0.7 + aSeed.x*30.0) * 0.35; p.z += cos(uTime*0.6 + aSeed.x*17.0) * 0.35;
+      p = mod(p, box);
+      vec3 wp = vec3(p.x - 35.0, p.y + 0.15, 6.0 - p.z);
+      vec4 mv = viewMatrix * vec4(wp, 1.0);
+      gl_Position = projectionMatrix * mv;
+      float dist = -mv.z;
+      gl_PointSize = clamp(aSeed.y * uScale / max(dist, 0.5), 1.0, 46.0);
+      vec3 vd = normalize(wp - cameraPosition);
+      float tw = 0.55 + 0.45*sin(uTime*(2.0 + aSeed.x*3.0) + aSeed.x*60.0);
+      float fs = 0.35 + 0.9*pow(max(dot(vd, uSunDir), 0.0), 3.0);                // catch the light toward the sun
+      vA = tw * fs * (1.0 - smoothstep(60.0, 110.0, dist)) * smoothstep(0.5, 2.0, dist) * (1.0 - 0.6*shadowAt(wp.xz));
+      vType = aSeed.z;
+    }
+  `, `
+    varying float vA; varying float vType;
+    void main(){
+      vec2 c = gl_PointCoord - 0.5; float d = length(c);
+      float a = smoothstep(0.5, 0.0, d); a *= a;
+      if (vType > 0.5) {                                                        // dandelion-style seed: little spokes
+        float spokes = pow(abs(cos(atan(c.y, c.x)*4.0)), 18.0) * smoothstep(0.5, 0.05, d) * 0.7;
+        a = max(a*0.5, spokes) + smoothstep(0.12, 0.0, d);
+      }
+      vec3 col = vType > 0.5 ? vec3(1.0, 0.97, 0.9) : vec3(1.0, 0.94, 0.75);
+      gl_FragColor = vec4(col, a * vA);
+    }
+  `, { uScale: { value: 800 } }, { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false; pts.renderOrder = 10;
+  return pts;
+}
+
+/* ==========================================================================
+   12. BIRDS: a few distant gliders with occasional bursts of flapping
+   ========================================================================== */
+function buildBirds() {
+  const v = [0,0,1.0,  0,0,-0.8,  -0.12,0,0,  0.12,0,0,  -0.14,0,0.25,  -0.14,0,-0.35,  -1.7,0,-0.25,
+             0.14,0,0.25,  0.14,0,-0.35,  1.7,0,-0.25];
+  const base = new THREE.BufferGeometry();
+  base.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+  base.setIndex([0, 2, 3,  2, 1, 3,  4, 5, 6,  7, 9, 8]);
+  const N = Q.birds, ctr = new Float32Array(N * 3), orb = new Float32Array(N * 3), sz = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    ctr[i * 3] = (rand() - 0.5) * 360; ctr[i * 3 + 1] = 55 + rand() * 90; ctr[i * 3 + 2] = -(170 + rand() * 260);
+    orb[i * 3] = 40 + rand() * 60; orb[i * 3 + 1] = (0.10 + rand() * 0.10) * (rand() < 0.5 ? -1 : 1); orb[i * 3 + 2] = rand() * 6.28;
+    sz[i] = 3.2 + rand() * 2.2;
+  }
+  const geo = instancedFrom(base, N);
+  addInst(geo, 'aCenter', ctr, 3); addInst(geo, 'aOrbit', orb, 3); addInst(geo, 'aSize', sz, 1);
+  const mat = makeMaterial(`
+    attribute vec3 aCenter; attribute vec3 aOrbit; attribute float aSize; varying vec3 vWorld;
+    void main(){
+      float ang = uTime*aOrbit.y + aOrbit.z, R = aOrbit.x;
+      vec3 c   = vec3(cos(ang)*R, sin(ang*0.6 + aOrbit.z)*6.0, sin(ang)*R*0.6);
+      vec3 vel = vec3(-sin(ang)*R, cos(ang*0.6 + aOrbit.z)*3.6, cos(ang)*R*0.6) * sign(aOrbit.y);
+      vec3 f = normalize(vel);
+      vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f));
+      vec3 u = cross(f, r);
+      float bk = 0.3;                                                           // bank into the turn
+      vec3 r2 = r*cos(bk) + u*sin(bk), u2 = u*cos(bk) - r*sin(bk);
+      float ax = abs(position.x);
+      float burst = smoothstep(0.55, 0.9, sin(uTime*0.35 + aOrbit.z*3.0));       // mostly gliding, sometimes flapping
+      float flap = sin(uTime*6.5 + aOrbit.z*5.0);
+      vec3 l = vec3(position.x, ax*(0.10 + 0.55*burst*flap), position.z - ax*0.1*burst*flap);
+      vec3 wp = aCenter + c + (r2*l.x + u2*l.y + f*l.z) * aSize;
+      vWorld = wp;
+      gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+    }
+  `, `
+    varying vec3 vWorld;
+    void main(){ gl_FragColor = vec4(hazeApply(vec3(0.07, 0.075, 0.09), vWorld, 1.0), 1.0); }
+  `, {}, { side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   13. BUTTERFLIES: tiny, erratic fliers near the flowers; blown around by gusts
+   ========================================================================== */
+function buildButterflies() {
+  const v = [], ix = [];
+  [1, -1].forEach((sgn, w) => {
+    const b = w * 4;
+    v.push(0, 0, 0.35,  0, 0, -0.35,  sgn * 1.0, 0, 0.5,  sgn * 0.9, 0, -0.55);
+    ix.push(b, b + 1, b + 3,  b, b + 3, b + 2);
+  });
+  const base = new THREE.BufferGeometry();
+  base.setAttribute('position', new THREE.Float32BufferAttribute(v, 3));
+  base.setIndex(ix);
+  const pal = [[0.98, 0.78, 0.10], [0.96, 0.96, 0.92], [0.95, 0.45, 0.12], [0.45, 0.65, 0.95], [0.9, 0.9, 0.35]];
+  const N = Q.butterflies, bs = new Float32Array(N * 3), sd = new Float32Array(N * 4), cl = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    bs[i * 3] = (rand() - 0.5) * 26; bs[i * 3 + 1] = 0.55 + rand() * 0.8; bs[i * 3 + 2] = 1 - rand() * 26;
+    sd[i * 4] = rand(); sd[i * 4 + 1] = 0.7 + rand() * 0.6; sd[i * 4 + 2] = 0.050 + rand() * 0.030; sd[i * 4 + 3] = rand();
+    const c = pal[i % pal.length]; cl[i * 3] = c[0]; cl[i * 3 + 1] = c[1]; cl[i * 3 + 2] = c[2];
+  }
+  const geo = instancedFrom(base, N);
+  addInst(geo, 'aBase', bs, 3); addInst(geo, 'aSeed', sd, 4); addInst(geo, 'aColor', cl, 3);
+  const mat = makeMaterial(`
+    attribute vec3 aBase; attribute vec4 aSeed; attribute vec3 aColor;
+    varying vec3 vCol; varying vec3 vWorld; varying float vU;
+    vec3 pathAt(float t, vec4 s){
+      float ph = s.x*6.283;
+      return vec3(sin(t*0.37 + ph)*2.4 + sin(t*0.91 + ph*2.0)*0.9,
+                  sin(t*0.53 + ph*1.7)*0.35 + sin(t*1.9 + ph)*0.12,
+                  cos(t*0.29 + ph)*2.0 + cos(t*0.77 + ph*3.0)*0.7);
+    }
+    void main(){
+      float t = uTime * aSeed.y;
+      vec2 push = windAt(aBase.xz).xy * 0.55;                                    // gusts shove them sideways
+      vec3 p0 = aBase + pathAt(t, aSeed);          p0.xz += push;
+      vec3 p1 = aBase + pathAt(t + 0.15, aSeed);   p1.xz += push;
+      vec3 f = normalize((p1 - p0) * vec3(1.0, 0.3, 1.0) + vec3(0.0001));
+      vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f));
+      vec3 u = cross(f, r);
+      float ang = 0.2 + 0.95*(0.5 + 0.5*sin(uTime*(21.0 + aSeed.x*5.0) + aSeed.x*30.0));   // wing beat
+      float ax = abs(position.x);
+      vec3 l = vec3(sign(position.x)*ax*cos(ang), ax*sin(ang), position.z);
+      vec3 wp = p0 + (r*l.x + u*l.y + f*l.z) * aSeed.z;
+      vCol = aColor; vWorld = wp; vU = ax;
+      gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+    }
+  `, `
+    varying vec3 vCol; varying vec3 vWorld; varying float vU;
+    void main(){
+      vec3 col = mix(vCol, vec3(0.08, 0.06, 0.05), smoothstep(0.78, 1.0, vU));
+      col = mix(col, vec3(1.0), smoothstep(0.12, 0.0, abs(vU - 0.55))*0.35);
+      gl_FragColor = vec4(hazeApply(col, vWorld, 1.0), 1.0);
+    }
+  `, {}, { side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+/* ==========================================================================
+   14. SKY DOME: gradient, sun, and two parallax layers of soft, morphing cumulus.
+       The fragment alpha channel carries a "sun-visible sky" mask used by the god-rays pass.
+   ========================================================================== */
+function buildSky() {
+  const L = (o) => `${o.alt.toFixed(1)}, ${o.sc.toFixed(8)}, ${o.cover.toFixed(3)}, vec2(${o.seed[0]}, ${o.seed[1]}), `;
+  const mat = makeMaterial(`
+    varying vec3 vDir;
+    void main(){
+      vDir = position;
+      vec4 p = projectionMatrix * vec4(mat3(viewMatrix) * position, 1.0);
+      gl_Position = p.xyww;                          // pinned to the far plane, so terrain always draws over it
+    }
+  `, `
+    varying vec3 vDir;
+
+    // One cloud layer: ray / horizontal-plane intersection, then lighting from the optical depth toward the sun.
+    vec4 cloudLayer(vec3 d, float alt, float sc, float cover, vec2 seed, float spd, float stp, float s){
+      float t = (alt - cameraPosition.y) / max(d.y, 0.02);
+      vec2 P = cameraPosition.xz + d.xz * t;
+      float a = cloudAt(P, sc, cover, seed, spd);
+      if (a < 0.004) return vec4(0.0);
+      vec2 sd = normalize(uSunDir.xz);
+      float a2 = cloudAt(P + sd * stp,        sc, cover, seed, spd);
+      float a3 = cloudAt(P + sd * stp * 2.7,  sc, cover, seed, spd);
+      float tau = a2 + 0.6 * a3;
+      float lit = mix(0.34, 1.0, exp(-tau * 0.85));
+      vec3 shadowCol = vec3(0.50, 0.59, 0.74);
+      vec3 litCol    = vec3(1.00, 0.955, 0.87);
+      vec3 col = mix(shadowCol, litCol, lit);
+      col = mix(col, litCol, (1.0 - a) * 0.5);                     // thin wisps are bright
+      float edge = a * (1.0 - a) * 4.0;
+      col += vec3(1.0, 0.84, 0.58) * edge * pow(s, 3.0) * 0.6;     // silver / golden lining facing the sun
+      float f = smoothstep(0.02, 0.20, d.y);                       // fade into the haze at the horizon
+      col = mix(col, uHazeCol, (1.0 - smoothstep(0.0, 0.35, d.y)) * 0.5);
+      return vec4(col, a * f);
+    }
+
+    void main(){
+      vec3 d = normalize(vDir);
+      float y = max(d.y, 0.0);
+      float s = max(dot(d, uSunDir), 0.0);
+
+      // clear-sky gradient: hazy horizon -> saturated blue zenith, warmed toward the sun
+      vec3 col = mix(uHazeCol, vec3(0.30, 0.58, 0.93), smoothstep(0.0, 0.28, y));
+      col = mix(col, vec3(0.07, 0.31, 0.82), smoothstep(0.18, 0.95, y));
+      col = mix(col, vec3(1.0, 0.88, 0.66), pow(s, 5.0) * 0.34);
+      col += vec3(1.0, 0.82, 0.52) * pow(s, 24.0) * 0.45;          // inner glow
+      col += vec3(1.0, 0.90, 0.72) * pow(s, 700.0) * 2.0;          // tight halo
+      col += vec3(1.0, 0.95, 0.82) * smoothstep(0.99978, 0.99992, s) * 9.0;   // sun disc (HDR, so it blooms)
+
+      // clouds: far layer first, near layer over it
+      vec4 c2 = cloudLayer(d, ${L(CLOUD_L2)}0.55, ${CLOUD_L2.step.toFixed(1)}, s);
+      vec4 c1 = cloudLayer(d, ${L(CLOUD_L1)}1.0,  ${CLOUD_L1.step.toFixed(1)}, s);
+      col = mix(col, c2.rgb, c2.a * 0.9);
+      col = mix(col, c1.rgb, c1.a);
+
+      // sun-visible-sky mask for the god rays (0..0.49, so it can never be confused with opaque geometry's 1.0)
+      float open = (1.0 - c1.a) * (1.0 - 0.85 * c2.a);
+      float ray  = open * (0.10 + 0.90 * pow(s, 5.0)) * smoothstep(0.0, 0.05, d.y + 0.03);
+      gl_FragColor = vec4(col, 0.49 * ray);
+    }
+  `, {}, { side: THREE.BackSide, depthWrite: false, depthFunc: THREE.LessEqualDepth });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 20), mat);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;             // opaque, drawn last: early-z skips covered pixels
+  return mesh;
+}
+
+/* ==========================================================================
+   15. CLOUD SHADOWS + SUN VISIBILITY (CPU mirror of the sky shader's cloud function)
+   ========================================================================== */
+const cloudState = { offX: 0, offZ: 0, morph: 0 };
+function cloudCPU(x, z, L, spd) {
+  let qx = (x + cloudState.offX * spd) * L.sc + L.seed[0], qy = (z + cloudState.offZ * spd) * L.sc + L.seed[1];
+  const m = cloudState.morph;
+  const a = vnoise(qx * 0.6 + m, qy * 0.6 + m), b = vnoise(qx * 0.6 + 31.7 - m, qy * 0.6 + 31.7 - m);
+  qx += 0.7 * a - 0.35; qy += 0.7 * b - 0.35;
+  return smoothstep(L.cover, L.cover + 0.15, fbm(qx, qy, Q.cloudOct));
+}
+
+const SH_N = Q.shadowRes;
+const shData = new Uint8Array(SH_N * SH_N * 4).fill(0);
+const shTex = new THREE.DataTexture(shData, SH_N, SH_N, THREE.RGBAFormat);
+shTex.minFilter = shTex.magFilter = THREE.LinearFilter;
+shTex.wrapS = shTex.wrapT = THREE.ClampToEdgeWrapping;
+shTex.generateMipmaps = false;
+U.uShadow.value = shTex;
+
+// Refreshed a slice of rows per frame, so the whole map renews ~8x/s without a CPU spike.
+let shRow = 0;
+function updateShadowSlice() {
+  const rows = Math.ceil(SH_N / 8), sx = SUN_DIR.x / SUN_DIR.y, sz = SUN_DIR.z / SUN_DIR.y;
+  for (let n = 0; n < rows; n++) {
+    const j = shRow; shRow = (shRow + 1) % SH_N;
+    const wz = SH_Z0 + (j + 0.5) / SH_N * SH_SIZE;
+    for (let i = 0; i < SH_N; i++) {
+      const wx = SH_X0 + (i + 0.5) / SH_N * SH_SIZE;
+      const d1 = cloudCPU(wx + sx * CLOUD_L1.alt, wz + sz * CLOUD_L1.alt, CLOUD_L1, 1.0);
+      const d2 = cloudCPU(wx + sx * CLOUD_L2.alt, wz + sz * CLOUD_L2.alt, CLOUD_L2, 0.55);
+      shData[(j * SH_N + i) * 4] = clamp(d1 + d2 * 0.45, 0, 1) * 255;
+    }
+  }
+  shTex.needsUpdate = true;
+}
+function prefillShadows() { for (let k = 0; k < 8; k++) updateShadowSlice(); }
+
+// How much direct sun reaches the camera / meadow right now (0 = fully clouded, 1 = clear). Smoothed.
+let sunVis = 1;
+function updateSunVisibility(k) {
+  const sx = SUN_DIR.x / SUN_DIR.y, sz = SUN_DIR.z / SUN_DIR.y;
+  let acc = 0;
+  for (let i = -1; i <= 1; i++) {                                    // 3 taps so it responds smoothly
+    const ox = i * 90;
+    const d1 = cloudCPU(CAM_POS.x + sx * (CLOUD_L1.alt - CAM_POS.y) + ox, CAM_POS.z + sz * (CLOUD_L1.alt - CAM_POS.y), CLOUD_L1, 1.0);
+    const d2 = cloudCPU(CAM_POS.x + sx * (CLOUD_L2.alt - CAM_POS.y) + ox, CAM_POS.z + sz * (CLOUD_L2.alt - CAM_POS.y), CLOUD_L2, 0.55);
+    acc += (1 - d1) * (1 - 0.85 * d2);
+  }
+  sunVis += (acc / 3 - sunVis) * k;
+}
+
+/* ==========================================================================
+   16. WIND SYSTEM: slow base breeze + random stronger gusts that travel across the meadow
+   ========================================================================== */
+const wind = {
+  base: 0.4,                 // user-controllable base strength (setWindStrength)
+  now: 0.4,                  // base breeze with slow natural variation
+  gust: 0,                   // current gust envelope value
+  gustPeak: 0, gustStart: -99, gustDur: 4, nextGust: 2.5,
+  effective: 0.4,            // what getWindStrength() reports
+  update(t, dt) {
+    this.now = this.base * (0.85 + 0.15 * Math.sin(t * 0.13) + 0.08 * Math.sin(t * 0.31 + 1.3));
+    if (t >= this.nextGust) {                                         // start a new gust every few seconds
+      this.gustPeak = 0.6 + Math.random() * 0.5;
+      this.gustStart = t; this.gustDur = 3.5 + Math.random() * 3.0;
+      this.nextGust = t + this.gustDur + 2.0 + Math.random() * 5.0;
+    }
+    const x = (t - this.gustStart) / this.gustDur;
+    const env = x < 0 || x > 1 ? 0 : Math.pow(Math.sin(Math.PI * x), 2);
+    this.gust = this.gustPeak * env * (0.3 + 0.7 * clamp(this.base, 0, 1.5));
+    this.effective = this.now + this.gust * 0.8;
+
+    U.uWind.value = this.now;
+    U.uGust.value = this.gust;
+    U.uGustPhase.value += dt * (0.09 + 0.14 * this.effective);      // gust bands travel ~7-15 m/s
+    const sp = (0.3 + this.effective * 1.2) * dt;                    // particles drift with the wind
+    U.uWindOff.value.x += U.uWindDir.value.x * sp;
+    U.uWindOff.value.y -= U.uWindDir.value.y * sp;                   // box z is world -z
+    // clouds: slow drift, a little faster in strong wind; the high layer moves slower (parallax)
+    const cs = (3.0 + this.effective * 3.0) * dt;
+    cloudState.offX -= U.uWindDir.value.x * cs; cloudState.offZ -= U.uWindDir.value.y * cs;
+    cloudState.morph += dt * 0.012;
+    U.uCloudOff.value.set(cloudState.offX, cloudState.offZ);
+    U.uMorph.value = cloudState.morph;
+  }
+};
+
+//__PART5__
+</script>
+</body>
+</html>
