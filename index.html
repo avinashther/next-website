@@ -101,15 +101,14 @@ const params = new URLSearchParams(location.search);
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const MOTION = reduceMotion ? 0.3 : 1;            // global time scale for all motion
 const weakDevice = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent) ||
-                   Math.min(innerWidth, innerHeight) < 600 ||
-                   (navigator.hardwareConcurrency || 8) <= 4;
+                   (navigator.hardwareConcurrency || 8) <= 2;            // window size no longer matters; adaptive DPR handles slow GPUs
 const LOW = params.get('quality') ? params.get('quality') === 'low' : weakDevice;
 
 const Q = LOW ? {
-  grass: 26000, flowers: 6000, trees: 3200, cloudOct: 4, particles: 380,
+  grass: 42000, flowers: 11000, trees: 4500, cloudOct: 4, particles: 380,
   birds: 4, butterflies: 7, maxDPR: 1.5, skyScale: 0.38, terrain: [150, 140], mtn: [120, 30], shadowRes: 64
 } : {
-  grass: 70000, flowers: 15000, trees: 9000, cloudOct: 5, particles: 900,
+  grass: 85000, flowers: 22000, trees: 9000, cloudOct: 5, particles: 900,
   birds: 6, butterflies: 14, maxDPR: 2, skyScale: 0.5, terrain: [260, 220], mtn: [220, 44], shadowRes: 128
 };
 
@@ -412,7 +411,7 @@ function buildTerrain() {
 
       // meadow base colour: large patches + fine grain (grain fades with distance => smooth far green)
       float p1 = vn(P*0.03), p2 = vn(P*0.4 + 7.0), fine = vn(P*3.1);
-      vec3 col = mix(vec3(0.12,0.29,0.05), vec3(0.30,0.52,0.10), clamp(p1*0.9 + p2*0.35 - 0.1, 0.0, 1.0));
+      vec3 col = mix(vec3(0.15,0.33,0.06), vec3(0.37,0.58,0.12), clamp(p1*0.9 + p2*0.35 - 0.1, 0.0, 1.0));
       col *= 0.9 + 0.2*fine*(1.0 - smoothstep(10.0, 90.0, dist));
 
       // forest belt on the slopes
@@ -420,14 +419,15 @@ function buildTerrain() {
       vec3 fcol = vec3(0.030,0.115,0.055) * (0.75 + 0.6*vn(P*1.1));
       col = mix(col, fcol, forest);
 
-      // daisy speckle: dense up close, thinning into smooth green far away
-      float fdist = 1.0 - smoothstep(30.0, 170.0, dist);
+      // distant daisy speckle only (real 3D daisies cover the foreground); fades into smooth green far away
+      float nearF = smoothstep(16.0, 45.0, dist), farF = 1.0 - smoothstep(70.0, 280.0, dist);
       float cluster = 0.55 + 0.45*smoothstep(0.3, 0.7, vn(P*0.07 + 3.0));
-      vec2 g = P*1.5; vec2 gi = floor(g); vec2 gf = fract(g);
+      vec2 g = P*1.1; vec2 gi = floor(g); vec2 gf = fract(g);
       vec2 jit = vec2(n2(gi + 13.0), n2(gi + 57.0))*0.6 + 0.2;
-      float fl = smoothstep(0.15, 0.06, length(gf - jit)) * step(1.0 - 0.55*cluster*fdist, n2(gi));
+      float rad = 0.10 + clamp(dist*0.0014, 0.0, 0.18);
+      float fl = smoothstep(rad, rad*0.35, length(gf - jit)) * step(1.0 - 0.5*cluster*nearF*farF, n2(gi));
       fl *= (1.0 - forest) * smoothstep(0.7, 0.85, N.y);
-      col = mix(col, vec3(0.96,0.95,0.88), fl*0.9);
+      col = mix(col, vec3(0.96,0.95,0.88), fl*0.8);
 
       // alpine pasture above the tree line, bare rock higher / steeper
       float alpine = smoothstep(95.0, 170.0, h) * (1.0 - forest);
@@ -438,7 +438,7 @@ function buildTerrain() {
       // golden sunlight + cool sky fill + moving cloud shadows
       float sh = shadowAt(P) * (1.0 - smoothstep(350.0, 560.0, dist));
       float ndl = dot(N, uSunDir);
-      vec3 light = vec3(0.44,0.57,0.78)*0.62 + vec3(1.0,0.86,0.62)*max(ndl*0.85 + 0.15, 0.0)*1.15*(1.0 - 0.72*sh);
+      vec3 light = vec3(0.44,0.57,0.78)*0.62 + vec3(1.0,0.86,0.62)*max(ndl*0.85 + 0.15, 0.0)*1.15*(1.0 - 0.5*sh);
       col *= light;
       gl_FragColor = vec4(hazeApply(col, vWorld, 1.0), 1.0);
     }
@@ -541,7 +541,7 @@ function buildGrass() {
     const x = Math.cos(ang) * dd, z = Math.sin(ang) * dd;
     const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
     off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
-    shape[i * 4]     = (0.30 + rand() * 0.34) * (0.8 + 0.55 * patch);              // height
+    shape[i * 4]     = (0.20 + rand() * 0.30) * (0.8 + 0.55 * patch);              // height
     shape[i * 4 + 1] = (0.032 + rand() * 0.026) * (1 + dd * 0.02);            // width (wider far away => no shimmer)
     shape[i * 4 + 2] = rand() * Math.PI;                                           // yaw
     shape[i * 4 + 3] = rand();                                                     // phase
@@ -578,7 +578,7 @@ function buildGrass() {
       vec3 col = mix(base, tip, pow(y, 0.8));
       col *= 0.40 + 0.60*pow(y, 0.6);                                            // cheap ambient occlusion
       float sh = shadowAt(P);
-      col *= 1.0 - 0.48*sh;                                                      // moving cloud shadows
+      col *= 1.0 - 0.34*sh;                                                      // moving cloud shadows
       vec3 vd = normalize(wp - cameraPosition);
       float back = pow(max(dot(vd, uSunDir), 0.0), 3.0);
       col += vec3(0.9, 0.75, 0.25) * back * 0.30 * y * (1.0 - 0.7*sh);           // sunlight shining through the blades
@@ -605,15 +605,17 @@ function buildFlowers() {
   // centre disc (part 2)
   const c0 = pos.length / 3;
   pos.push(0, 0, 0); part.push(2);
-  for (let s = 0; s < 8; s++) { const a = s / 8 * Math.PI * 2; pos.push(Math.cos(a) * 0.27, Math.sin(a) * 0.27, 0); part.push(2); }
+  for (let s = 0; s < 8; s++) { const a = s / 8 * Math.PI * 2; pos.push(Math.cos(a) * 0.21, Math.sin(a) * 0.21, 0); part.push(2); }
   for (let s = 0; s < 8; s++) idx.push(c0, c0 + 1 + s, c0 + 1 + (s + 1) % 8);
   // petals (part 1)
   for (let p = 0; p < 10; p++) {
     const a = p / 10 * Math.PI * 2, b = pos.length / 3;
-    pos.push(Math.cos(a - 0.30) * 0.24, Math.sin(a - 0.30) * 0.24, 0,
-             Math.cos(a + 0.30) * 0.24, Math.sin(a + 0.30) * 0.24, 0,
-             Math.cos(a), Math.sin(a), 0);
-    part.push(1, 1, 1); idx.push(b, b + 1, b + 2);
+    const P = (ang, r) => pos.push(Math.cos(ang) * r, Math.sin(ang) * r, 0);
+    P(a - 0.26, 0.20); P(a + 0.26, 0.20);            // base
+    P(a - 0.31, 0.62); P(a + 0.31, 0.62);            // wide middle => rounded, full petal
+    P(a, 1.0);                                        // tip
+    part.push(1, 1, 1, 1, 1);
+    idx.push(b, b + 1, b + 2,  b + 1, b + 3, b + 2,  b + 2, b + 3, b + 4);
   }
   const base = new THREE.BufferGeometry();
   base.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -627,8 +629,8 @@ function buildFlowers() {
     const x = Math.cos(ang) * dd, z = Math.sin(ang) * dd;
     const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
     off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
-    prm[i * 4]     = (0.36 + rand() * 0.38) * (0.85 + 0.4 * patch);   // stem height
-    prm[i * 4 + 1] = 0.036 + rand() * 0.018;                           // head radius
+    prm[i * 4]     = (0.40 + rand() * 0.45) * (0.85 + 0.4 * patch);   // stem height
+    prm[i * 4 + 1] = 0.052 + rand() * 0.024;                           // head radius
     prm[i * 4 + 2] = rand();                                           // phase
     prm[i * 4 + 3] = 0.7 + rand() * 0.6;                               // stiffness
     tint[i] = rand();
@@ -642,7 +644,7 @@ function buildFlowers() {
     void main(){
       vec2 P = aOffset.xz;
       float k = smoothstep(0.55, 1.25, length((P - uClear.xy) / uClear.zw));
-      float H = aParam.x * mix(0.2, 1.0, k);
+      float H = aParam.x * mix(0.0, 1.0, smoothstep(0.0, 1.0, k * 1.15 - 0.1));
       vec3 w = windAt(P);                                                        // same wind, different stiffness/phase
       vec2 wd = w.xy * 0.42 * H / aParam.w;
       float sway = sin(uTime*(1.8 + aParam.z*1.4) + aParam.z*30.0 + dot(P, vec2(0.4, 0.2))) * 0.03 * H * (0.3 + uWind*0.8 + uGust*0.4);
@@ -662,21 +664,21 @@ function buildFlowers() {
         vec3 T = normalize(cross(vec3(0.0, 1.0, 0.0), N));
         vec3 B = cross(N, T);
         float dist = length(stem - cameraPosition);
-        float size = aParam.y * (1.0 + smoothstep(8.0, 70.0, dist)*1.1) * mix(0.6, 1.0, k);  // slightly larger far away
+        float size = aParam.y * (1.0 + smoothstep(8.0, 70.0, dist)*1.1) * smoothstep(0.0, 0.6, k);  // slightly larger far away
         wp = stem + (T*position.x + B*position.y)*size + N*(aPart > 1.5 ? 0.004 : 0.0);
         vec3 vd = normalize(wp - cameraPosition);
         float back = pow(max(dot(vd, uSunDir), 0.0), 3.0);
         if (aPart < 1.5) {
           float r = length(position.xy);
-          col = mix(vec3(0.80,0.86,0.72), vec3(1.0,0.99,0.96), smoothstep(0.15, 0.6, r)) * (0.9 + 0.1*aTint);
-          col *= 0.8 + 0.25*abs(dot(N, uSunDir));
+          col = mix(vec3(0.86,0.90,0.78), vec3(1.0,1.0,1.0), smoothstep(0.15, 0.5, r)) * (1.0 + 0.1*aTint);
+          col *= 0.86 + 0.22*abs(dot(N, uSunDir));
           col += vec3(1.0, 0.82, 0.45) * back * 0.22;                            // petals glow when backlit
         } else {
           col = vec3(0.98, 0.73, 0.07) * (0.85 + 0.2*aTint);
           col += vec3(0.5, 0.35, 0.0) * back * 0.15;
         }
       }
-      col *= 1.0 - 0.45*shadowAt(P);
+      col *= 1.0 - 0.32*shadowAt(P);
       vCol = col; vWorld = wp;
       gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
     }
@@ -1179,7 +1181,11 @@ const compositePass = makePass(`
     vec3 over = max(col - 0.85, 0.0);
     col = min(col, vec3(0.85)) + over / (1.0 + over * 6.667);
     float lum = dot(col, vec3(0.299, 0.587, 0.114));
-    col = mix(vec3(lum), col, 1.07);
+    col = mix(vec3(lum), col, 1.16);                                         // richer colour
+    col += vec3(-0.010, 0.004, 0.016) * (1.0 - smoothstep(0.0, 0.45, lum));   // cool shadows
+    col += vec3(0.030, 0.014, -0.012) * smoothstep(0.45, 1.0, lum);           // warm highlights
+    vec3 cc = clamp(col, 0.0, 1.0);
+    col = mix(col, cc * cc * (3.0 - 2.0 * cc), 0.32);                         // gentle filmic S-curve
     vec2 v = (vUv - 0.5) * vec2(uAspect * 0.55 + 0.45, 1.0);
     col *= 1.0 - 0.20 * smoothstep(0.45, 1.05, length(v));
     col += (hash12(gl_FragCoord.xy + fract(uTime) * 37.0) - 0.5) / 255.0;
@@ -1319,7 +1325,7 @@ function buildPanda() {
 
   // lighting that follows the scene's sun, dimmed when a cloud shadow passes over the panda
   const sunLight = new THREE.DirectionalLight(0xfff1d6, 0.55); sunLight.position.copy(SUN_DIR).multiplyScalar(20);
-  const hemi = new THREE.HemisphereLight(0xbcd8ff, 0x6e8c3c, 0.45);
+  const hemi = new THREE.HemisphereLight(0xcfe2ff, 0xa5b48a, 0.5);
   scene.add(sunLight, hemi);
 
   const panda = new THREE.Group(); panda.scale.setScalar(PS); scene.add(panda);
@@ -1489,7 +1495,7 @@ function buildPanda() {
   return { group: panda, update, get position() { return panda.position; }, setBounds(r) { /* reserved */ } };
 }
 const panda = buildPanda();
-view.dist = view.distT = 6.5; view.pitch = -0.16;                     // start behind the panda, looking at it
+view.dist = view.distT = 6.0; view.pitch = -0.10;                     // start behind the panda, looking at it
 
 /* ==========================================================================
    21. PUBLIC API (window.sceneAPI): lets the fridge / UI sync with wind, sun and clouds later
