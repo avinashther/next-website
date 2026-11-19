@@ -42,12 +42,26 @@
 
   /* Small, self-dismissing control hint. */
   #hint {
-    position: fixed; left: 0; right: 0; top: 18px; z-index: 3; text-align: center; pointer-events: none;
+    position: fixed; left: 0; right: 0; bottom: calc(8px + env(safe-area-inset-bottom, 0px)); z-index: 3; text-align: center; pointer-events: none;
     font: 500 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: .08em; color: rgba(255,255,255,.92);
     text-shadow: 0 1px 6px rgba(0,0,0,.45); opacity: 0; transition: opacity 1.2s ease;
   }
   #hint.show { opacity: .9; }
   #hint.gone { opacity: 0; }
+
+  /* Panda controls: status pill, joystick and action buttons. */
+  #statusWrap { position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); left: 0; right: 0; text-align: center; z-index: 4; pointer-events: none; }
+  #status { display: inline-block; background: rgba(255,255,255,.82); color: #2b2b2b; padding: 6px 14px; border-radius: 20px;
+    font: 600 14px system-ui, -apple-system, "Segoe UI", sans-serif; box-shadow: 0 2px 10px rgba(0,0,0,.15); }
+  #stick { position: fixed; left: 22px; bottom: calc(34px + env(safe-area-inset-bottom, 0px)); width: 120px; height: 120px; z-index: 4;
+    border-radius: 50%; background: rgba(255,255,255,.5); box-shadow: 0 4px 14px rgba(0,0,0,.18); touch-action: none; }
+  #knob { position: absolute; left: 32px; top: 32px; width: 56px; height: 56px; border-radius: 50%; background: #ff8fb1; box-shadow: 0 3px 8px rgba(0,0,0,.3); }
+  #btns { position: fixed; right: 20px; bottom: calc(34px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 10px; z-index: 4; }
+  #btns button { font: 600 15px system-ui, -apple-system, "Segoe UI", sans-serif; padding: 11px 18px; min-width: 104px; border: 0; border-radius: 16px;
+    background: rgba(255,255,255,.85); color: #2b2b2b; box-shadow: 0 4px 12px rgba(0,0,0,.18); cursor: pointer; touch-action: manipulation; }
+  #btns button.on { background: #ff8fb1; color: #fff; }
+  #btns button:active { transform: scale(.95); }
+  @media (max-width: 600px) { #stick { width: 104px; height: 104px; left: 14px; } #knob { left: 24px; top: 24px; } #btns { right: 12px; } #btns button { min-width: 92px; padding: 10px 14px; } }
 
   /* Reserved (invisible) slot for the fridge that will be added later.
      Bottom-center, layered above the canvas. */
@@ -62,7 +76,10 @@
 <canvas id="scene"></canvas>
 <div id="fallback"></div>
 <div id="fridge-slot" aria-hidden="true"></div>
-<div id="hint">Drag to look around &middot; scroll or pinch to zoom</div>
+<div id="hint">WASD or joystick to move &middot; Space to jump &middot; drag to look around &middot; scroll or pinch to zoom</div>
+<div id="statusWrap"><span id="status">&#x1F43C; Idle</span></div>
+<div id="stick"><div id="knob"></div></div>
+<div id="btns"><button id="bJump">&#x2B06;&#xFE0F; Jump</button><button id="bWalk">&#x1F43E; Walk</button><button id="bSleep">&#x1F4A4; Sleep</button></div>
 <div id="loader"><div class="spinner"></div><div>Loading meadow</div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -172,7 +189,8 @@ const U = {
   uHazeDen:   { value: 0.00036 },
   uNoise:     { value: noiseTex },
   uShadow:    { value: null },                        // set after the shadow texture exists
-  uClear:     { value: new THREE.Vector4(CLEAR.x, CLEAR.z, CLEAR.rx, CLEAR.rz) }
+  uClear:     { value: new THREE.Vector4(CLEAR.x, CLEAR.z, CLEAR.rx, CLEAR.rz) },
+  uCenter:    { value: new THREE.Vector3(0, 0, 0) }   // dust + butterflies stay around this point
 };
 
 const GLSL_COMMON = `
@@ -189,6 +207,7 @@ uniform vec3  uSunDir;
 uniform vec3  uHazeCol;
 uniform float uHazeDen;
 uniform vec4  uClear;
+uniform vec3  uCenter;
 uniform sampler2D uNoise;
 uniform sampler2D uShadow;
 
@@ -695,7 +714,7 @@ function buildParticles() {
       p.y  += sin(uTime*(0.4 + aSeed.w*0.5) + aSeed.x*20.0) * 0.5;
       p.x  += sin(uTime*0.7 + aSeed.x*30.0) * 0.35; p.z += cos(uTime*0.6 + aSeed.x*17.0) * 0.35;
       p = mod(p, box);
-      vec3 wp = vec3(p.x - 35.0, p.y + 0.15, p.z - 55.0);
+      vec3 wp = vec3(p.x - 35.0, p.y + 0.15, p.z - 55.0) + vec3(uCenter.x, 0.0, uCenter.z);
       vec4 mv = viewMatrix * vec4(wp, 1.0);
       gl_Position = projectionMatrix * mv;
       float dist = -mv.z;
@@ -802,9 +821,10 @@ function buildButterflies() {
     }
     void main(){
       float t = uTime * aSeed.y;
-      vec2 push = windAt(aBase.xz).xy * 0.55;                                    // gusts shove them sideways
-      vec3 p0 = aBase + pathAt(t, aSeed);          p0.xz += push;
-      vec3 p1 = aBase + pathAt(t + 0.15, aSeed);   p1.xz += push;
+      vec3 B0 = aBase + vec3(uCenter.x, 0.0, uCenter.z);
+      vec2 push = windAt(B0.xz).xy * 0.55;                                    // gusts shove them sideways
+      vec3 p0 = B0 + pathAt(t, aSeed);          p0.xz += push;
+      vec3 p1 = B0 + pathAt(t + 0.15, aSeed);   p1.xz += push;
       vec3 f = normalize((p1 - p0) * vec3(1.0, 0.3, 1.0) + vec3(0.0001));
       vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f));
       vec3 u = cross(f, r);
@@ -1282,6 +1302,196 @@ function updateCamera(rdt, t) {
 }
 
 /* ==========================================================================
+   20b. PANDA: the character from Cute_3D_Panda.html, walking around the meadow.
+        Joystick / WASD move it relative to the camera; the camera follows it.
+   ========================================================================== */
+function buildPanda() {
+  const PS = 0.38, LIMIT = 58, SEG = LOW ? [20, 14] : [32, 24];       // body scale (metres per model unit), walk radius
+  const T = c => new THREE.MeshToonMaterial({ color: c });
+  const white = T(0xfffdf8), black = T(0x1a1a1e), pink = T(0xff9db8);
+  const outM = new THREE.MeshBasicMaterial({ color: 0x3b2417, side: THREE.BackSide });
+  const ball = (mat, r, sx = 1, sy = 1, sz = 1, ol = true) => {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(r, SEG[0], SEG[1]), mat); m.scale.set(sx, sy, sz);
+    if (ol) { const o = new THREE.Mesh(m.geometry, outM); o.scale.setScalar(1.05); m.add(o); }   // cartoon outline
+    return m;
+  };
+  const at = (o, x, y, z) => { o.position.set(x, y, z); return o; };
+
+  // lighting that follows the scene's sun, dimmed when a cloud shadow passes over the panda
+  const sunLight = new THREE.DirectionalLight(0xfff1d6, 0.55); sunLight.position.copy(SUN_DIR).multiplyScalar(20);
+  const hemi = new THREE.HemisphereLight(0xbcd8ff, 0x6e8c3c, 0.45);
+  scene.add(sunLight, hemi);
+
+  const panda = new THREE.Group(); panda.scale.setScalar(PS); scene.add(panda);
+  const shadow = new THREE.Mesh(new THREE.CircleGeometry(1.2, 24),
+    new THREE.MeshBasicMaterial({ color: 0, transparent: true, opacity: 0.25, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  shadow.rotation.x = -Math.PI / 2; shadow.renderOrder = 3; scene.add(shadow);
+  const rig = new THREE.Group(); panda.add(rig);
+  rig.add(ball(black, 1, .78, .9, .72));
+  rig.add(at(ball(white, 1, .58, .7, .42), 0, -.1, .4));                       // belly
+  rig.add(at(ball(black, .26), .28, -.5, -.65));                              // tail
+  const head = new THREE.Group(); at(head, 0, 1.5, .05); rig.add(head);
+  head.add(ball(white, .95, 1.15, .95, .95));
+  const patchM = T(0x2b2b31), eyeM = T(0x0e0b0b), brownM = T(0x3b2417), innerM = T(0x42424a);
+  const eyes = [];
+  [-1, 1].forEach(sd => {
+    const ear = at(ball(black, .3, 1, 1, .6), sd * .86, .8, -.05); ear.rotation.z = -sd * .35; head.add(ear);
+    const ei = at(ball(innerM, .12, 1, 1, .4, false), sd * .88, .8, .15); ei.rotation.z = -sd * .35; head.add(ei);
+    const pt = at(ball(patchM, .3, .9, 1.25, .35, false), sd * .42, .02, .78); pt.rotation.set(0, sd * .35, sd * .45); head.add(pt);
+    const ck = at(ball(pink, .17, 1.1, .7, .3, false), sd * .7, -.36, .62); ck.rotation.y = sd * .8; head.add(ck);
+    const e = new THREE.Group(); e.position.set(sd * .37, .04, .88);
+    e.add(ball(eyeM, .1, 1, 1.25, .6, false), at(ball(white, .035, 1, 1, 1, false), .03, .06, .06), at(ball(white, .018, 1, 1, 1, false), -.03, -.04, .06));
+    head.add(e); eyes.push(e);
+    const br = new THREE.Mesh(new THREE.TorusGeometry(.1, .02, 6, 12, Math.PI), brownM); br.position.set(sd * .4, .4, .76); br.rotation.set(0, sd * .3, -sd * .12); head.add(br);
+  });
+  head.add(at(ball(eyeM, .1, 1.3, .85, .8, false), 0, -.17, .9));              // nose
+  const half = (r, c, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.CircleGeometry(r, 24, Math.PI, Math.PI), T(c));
+    m.material.side = THREE.DoubleSide; m.position.set(x, y, z); head.add(m); return m;
+  };
+  half(.225, 0x3b2417, 0, -.285, .866); half(.2, 0x7a1f33, 0, -.3, .87); half(.08, 0xff7f9a, 0, -.42, .874);   // smile + tongue
+  const caps = (mat, r, len) => {
+    const pts = [], n = 10, h = len / 2;
+    for (let i = 0; i <= n; i++) { const a = i / n * Math.PI / 2; pts.push(new THREE.Vector2(r * Math.sin(a), -h - r * Math.cos(a))); }
+    for (let i = 0; i <= n; i++) { const a = Math.PI / 2 + i / n * Math.PI / 2; pts.push(new THREE.Vector2(r * Math.sin(a), h - r * Math.cos(a))); }
+    pts.forEach(q => { q.x *= 1.15 - .2 * ((q.y + h + r) / (len + 2 * r)); });
+    const m = new THREE.Mesh(new THREE.LatheGeometry(pts, LOW ? 18 : 28), mat), o = new THREE.Mesh(m.geometry, outM);
+    o.scale.setScalar(1.05); m.add(o); return m;
+  };
+  const limbs = {};
+  [['aL', -1], ['aR', 1]].forEach(([n, sd]) => {
+    const g = at(new THREE.Group(), sd * .42, .35, .05); g.rotation.order = 'ZXY';
+    rig.add(at(ball(black, .42, 1, .9, 1, false), sd * .52, .36, .05));        // shoulder
+    g.add(at(caps(black, .28, .75), 0, -.67, 0)); rig.add(g); limbs[n] = g;
+  });
+  [['lL', -.5], ['lR', .5]].forEach(([n, x]) => {
+    const g = at(new THREE.Group(), x, -.45, .15); g.rotation.y = x > 0 ? .3 : -.3;
+    g.add(at(caps(black, .36, .2), 0, -.25, 0));
+    g.add(at(ball(black, 1, .4, .22, .52), 0, -.45, .2));                       // foot
+    rig.add(g); limbs[n] = g;
+  });
+
+  // "Zzz" sprites while sleeping
+  const zTex = () => {
+    const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d');
+    x.font = 'bold 54px sans-serif'; x.fillStyle = '#fff'; x.strokeStyle = '#6a7fd8'; x.lineWidth = 6; x.textAlign = 'center';
+    x.strokeText('Z', 32, 50); x.fillText('Z', 32, 50); return new THREE.CanvasTexture(c);
+  };
+  const zs = [0, 1, 2].map(() => { const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: zTex(), transparent: true, depthWrite: false })); sp.visible = false; scene.add(sp); return sp; });
+
+  // ---- input: joystick + WASD, jump / walk / sleep buttons ----
+  let jx = 0, jy = 0, autoWalk = false, sleeping = false, jumpReq = false;
+  const keys = {};
+  const stick = document.getElementById('stick'), knob = document.getElementById('knob');
+  const bW = document.getElementById('bWalk'), bS = document.getElementById('bSleep'), bJ = document.getElementById('bJump'), st = document.getElementById('status');
+  let stickDrag = false;
+  const stickMove = e => {
+    const r = stick.getBoundingClientRect(), R = r.width * 0.27;
+    let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+    const m = Math.hypot(dx, dy); if (m > R) { dx = dx / m * R; dy = dy / m * R; }
+    knob.style.transform = `translate(${dx}px,${dy}px)`; jx = dx / R; jy = dy / R;
+  };
+  stick.addEventListener('pointerdown', e => { stickDrag = true; stick.setPointerCapture(e.pointerId); stickMove(e); dismissHint(); });
+  stick.addEventListener('pointermove', e => { if (stickDrag) stickMove(e); });
+  const stickEnd = () => { stickDrag = false; jx = jy = 0; knob.style.transform = ''; };
+  stick.addEventListener('pointerup', stickEnd); stick.addEventListener('pointercancel', stickEnd);
+  addEventListener('keydown', e => {
+    if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    keys[e.key.toLowerCase()] = 1;
+    if (e.code === 'Space') { jump(); e.preventDefault(); }
+    if ('wasd'.includes(e.key.toLowerCase()) && e.key.length === 1) dismissHint();
+  });
+  addEventListener('keyup', e => { keys[e.key.toLowerCase()] = 0; if (e.code === 'Space') e.preventDefault(); });
+  addEventListener('blur', () => { for (const k in keys) keys[k] = 0; });
+  const jump = () => { if (!sleeping) jumpReq = true; };
+  const setSleep = v => { sleeping = v; bS.classList.toggle('on', v); bS.innerHTML = v ? '&#x2600;&#xFE0F; Wake' : '&#x1F4A4; Sleep'; if (v) { autoWalk = false; bW.classList.remove('on'); } };
+  bJ.onclick = () => { jump(); bJ.blur(); };
+  bW.onclick = () => { if (sleeping) setSleep(false); autoWalk = !autoWalk; bW.classList.toggle('on', autoWalk); bW.blur(); };
+  bS.onclick = () => { setSleep(!sleeping); bS.blur(); };
+
+  // ---- simulation ----
+  let phase = 0, vy = 0, h = 0, face = Math.PI, squash = 0, t = 0, wake = 0;
+  const lerp = (a, b, k) => a + (b - a) * k;
+  panda.rotation.y = face; panda.position.set(0, terrainH(0, 0), 0);
+  const tgt = new THREE.Vector3();
+
+  function update(rdt) {
+    const dt = Math.min(rdt, 0.05); t += dt;
+    const px0 = panda.position.x, pz0 = panda.position.z;
+    let ix = jx + ((keys.d ? 1 : 0) - (keys.a ? 1 : 0)), iz = jy + ((keys.s ? 1 : 0) - (keys.w ? 1 : 0));
+    const mag = Math.min(1, Math.hypot(ix, iz));
+    let moving = false, speed = 0, mx = 0, mz = 0;
+    if (!sleeping) {
+      if (mag > .08) {
+        if (autoWalk) { autoWalk = false; bW.classList.remove('on'); }
+        const cy = Math.cos(view.yaw), sy = Math.sin(view.yaw);               // move relative to where the camera looks
+        mx = ix * cy + iz * sy; mz = -ix * sy + iz * cy;
+        face = Math.atan2(mx, mz); moving = true; speed = 3.2 * mag;
+      } else if (autoWalk) {
+        moving = true; speed = 1.8; mx = Math.sin(panda.rotation.y); mz = Math.cos(panda.rotation.y);
+        if (Math.hypot(px0, pz0) > LIMIT - 8) { mx = -px0; mz = -pz0; face = Math.atan2(mx, mz); }   // turn back toward the middle
+        else face = panda.rotation.y;
+      }
+    }
+    let d = face - panda.rotation.y; d = Math.atan2(Math.sin(d), Math.cos(d)); panda.rotation.y += d * Math.min(1, dt * 10);
+    if (moving) {
+      const l = Math.hypot(mx, mz) || 1;
+      let nx = px0 + mx / l * speed * dt, nz = pz0 + mz / l * speed * dt;
+      const r = Math.hypot(nx, nz); if (r > LIMIT) { nx *= LIMIT / r; nz *= LIMIT / r; }
+      panda.position.x = nx; panda.position.z = nz;
+      phase += dt * speed * 3.6;
+    }
+    // jump (height in metres)
+    if (jumpReq && h <= 0) { vy = 6.6; } jumpReq = false;
+    if (h > 0 || vy > 0) { vy -= 18 * dt; h += vy * dt; if (h <= 0) { h = 0; vy = 0; squash = 1; } }
+    const air = h > 0;
+
+    wake = lerp(wake, sleeping ? 1 : 0, Math.min(1, dt * 4));
+    const sw = Math.sin(phase), walkK = moving && !air ? 1 : 0;
+    limbs.lL.rotation.x = air ? -.8 : sw * .7 * walkK;  limbs.lR.rotation.x = air ? -.8 : -sw * .7 * walkK;
+    limbs.aL.rotation.x = air ? 0 : -sw * .6 * walkK;   limbs.aR.rotation.x = air ? 0 : sw * .6 * walkK;
+    limbs.aL.rotation.z = air ? -2.4 : -1.15;           limbs.aR.rotation.z = air ? 2.4 : 1.15;
+    const bob = moving && !air ? Math.abs(Math.cos(phase)) * .12 : 0;
+    const breathe = Math.sin(t * (sleeping ? 1.6 : 2.2)) * (sleeping ? .04 : .015);
+    squash = Math.max(0, squash - dt * 5);
+    const sq = Math.sin(squash * Math.PI) * .18;
+    rig.scale.set(1 + sq + breathe * .5, 1 - sq + breathe, 1 + sq + breathe * .5);
+    rig.rotation.z = wake * 1.45 + (moving ? Math.sin(phase) * .05 : 0);
+    rig.position.y = 1.1 + bob - wake * .3;
+    head.rotation.x = wake * .35 + (moving ? .05 : 0); head.rotation.z = moving ? Math.sin(phase) * .06 : Math.sin(t * 1.2) * .03;
+    const blink = sleeping ? .1 : (Math.sin(t * 1.7) > .985 ? .1 : 1);
+    eyes.forEach(e => e.scale.y = lerp(e.scale.y, blink, .4));
+
+    const px = panda.position.x, pz = panda.position.z, gy = terrainH(px, pz);
+    panda.position.y = gy + h;
+    const hs = h / PS, ss = Math.max(.4, 1 - hs * .15) * (1 + wake * .5) * PS;
+    shadow.position.set(px, gy + 0.05, pz); shadow.scale.set(ss, ss, ss);
+    zs.forEach((sp, i) => {
+      sp.visible = sleeping && panda.visible; if (!sleeping) return;
+      const k = ((t * .4 + i / 3) % 1);
+      sp.position.set(px + (.4 + k * .8) * PS * 1.6, gy + (2.3 + k * 1.6) * PS * 1.2, pz + .2 * PS);
+      const sc = (.5 + k * .7) * PS * 1.6; sp.scale.set(sc, sc, 1); sp.material.opacity = 1 - k;
+    });
+    st.innerHTML = sleeping ? '&#x1F634; Sleeping' : air ? '&#x1F998; Jumping' : moving ? '&#x1F43E; Walking' : '&#x1F43C; Idle';
+
+    // meadow reacts to the panda: short grass around its feet, dust and butterflies stay nearby
+    U.uClear.value.set(px, pz, 1.9, 1.9);
+    U.uCenter.value.set(px, 0, pz);
+    // match lighting to the sky: cloud shadows dim the sun on the panda
+    const si = Math.floor((px - SH_X0) / SH_SIZE * SH_N), sj = Math.floor((pz - SH_Z0) / SH_SIZE * SH_N);
+    const csh = shData[(sj * SH_N + si) * 4] / 255;
+    sunLight.intensity = lerp(sunLight.intensity, 0.55 * (1 - 0.65 * csh), Math.min(1, dt * 3));
+    // camera follows (smoothly); hide the panda when zoomed all the way into first person
+    tgt.set(px, gy + 1.0 + h * 0.6, pz);
+    view.target.lerp(tgt, 1 - Math.exp(-rdt * 9));
+    panda.visible = shadow.visible = view.dist > 0.9;
+  }
+  return { group: panda, update, get position() { return panda.position; }, setBounds(r) { /* reserved */ } };
+}
+const panda = buildPanda();
+view.dist = view.distT = 6.5; view.pitch = -0.16;                     // start behind the panda, looking at it
+
+/* ==========================================================================
    21. PUBLIC API (window.sceneAPI): lets the fridge / UI sync with wind, sun and clouds later
    ========================================================================== */
 const frameCallbacks = [];
@@ -1310,6 +1520,8 @@ const sceneAPI = {
   /** Camera rig: { yaw, pitch, dist, distT, target:Vector3 }. Move `target` to make the camera follow something. */
   view,
   setView(o) { if (!o) return; ['yaw', 'pitch'].forEach(k => { if (k in o) view[k] = Number(o[k]); }); if ('dist' in o) view.dist = view.distT = clamp(Number(o.dist), 0, DIST_MAX); },
+  /** The panda: { group, position, update }. */
+  panda,
   /** Ground height at world (x, z). */
   getGroundHeight: terrainH,
   // Handy escape hatches for later components that want to share the same GL context / camera.
@@ -1367,6 +1579,7 @@ function frame(now) {
   wind.update(simT, dt);
   if (!LOW || (frameNo & 1) === 0) updateShadowSlice();                  // cloud shadows on the meadow
   updateSunVisibility(1 - Math.exp(-dt * 2.5));
+  panda.update(rdt);
   updateCamera(rdt, simT);
   camera.updateMatrixWorld();
   updateSunScreen(simT);
