@@ -11,7 +11,9 @@
   #scene {
     position: fixed; inset: 0; width: 100%; height: 100%; display: block;
     z-index: 0; opacity: 0; transition: opacity 1.8s ease;
+    touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none;
   }
+  #scene.drag { cursor: grabbing; }
   #scene.ready { opacity: 1; }
 
   /* Static fallback if WebGL / Three.js is unavailable. */
@@ -38,6 +40,15 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 
+  /* Small, self-dismissing control hint. */
+  #hint {
+    position: fixed; left: 0; right: 0; top: 18px; z-index: 3; text-align: center; pointer-events: none;
+    font: 500 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: .08em; color: rgba(255,255,255,.92);
+    text-shadow: 0 1px 6px rgba(0,0,0,.45); opacity: 0; transition: opacity 1.2s ease;
+  }
+  #hint.show { opacity: .9; }
+  #hint.gone { opacity: 0; }
+
   /* Reserved (invisible) slot for the fridge that will be added later.
      Bottom-center, layered above the canvas. */
   #fridge-slot {
@@ -51,6 +62,7 @@
 <canvas id="scene"></canvas>
 <div id="fallback"></div>
 <div id="fridge-slot" aria-hidden="true"></div>
+<div id="hint">Drag to look around &middot; scroll or pinch to zoom</div>
 <div id="loader"><div class="spinner"></div><div>Loading meadow</div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -125,7 +137,7 @@ function fbm(x, y, oct) {
 /* ==========================================================================
    2. SCENE CONSTANTS
    ========================================================================== */
-const CAM_POS = new THREE.Vector3(0, 1.35, 7);
+const CAM_POS = new THREE.Vector3(0, 1.35, 0);          // world centre: the meadow is a round basin around this point
 const CAM_PITCH = THREE.MathUtils.degToRad(3.2);
 
 // Sun: golden hour, ahead and to the right, fairly low.
@@ -134,10 +146,10 @@ const SUN_DIR = new THREE.Vector3(
   Math.sin(SUN_AZ) * Math.cos(SUN_EL), Math.sin(SUN_EL), -Math.cos(SUN_AZ) * Math.cos(SUN_EL)).normalize();
 
 // Short-grass clearing where the fridge will stand (bottom-centre of the screen).
-const CLEAR = { x: 0, z: 1.9, rx: 2.4, rz: 3.2 };
+const CLEAR = { x: 0, z: 0, rx: 0.01, rz: 0.01 };       // short-grass patch (disabled for now; the panda will carry it)
 
 // World region covered by the cloud-shadow texture (metres).
-const SH_X0 = -300, SH_Z0 = -540, SH_SIZE = 600;
+const SH_X0 = -450, SH_Z0 = -450, SH_SIZE = 900;
 
 // Cloud layers (shared by the sky shader, the shadow map and the CPU sun-visibility estimate).
 const CLOUD_L1 = { alt: 1100, sc: 1 / 720,  cover: 0.53, seed: [3.1, 7.7],   step: 110 };
@@ -229,25 +241,27 @@ vec3 windAt(vec2 P){
 /* ==========================================================================
    4. WORLD HEIGHT FIELD (CPU side; used for mesh building + instance placement)
    ========================================================================== */
-// Half-width of the flat meadow floor; narrows with distance so the valley closes in.
-const edgeW = d => 150 - 50 * smoothstep(0, 700, d);
+// Radius of the flat meadow floor in each direction (varies smoothly with the angle, so the rim isn't a perfect circle).
+const edgeAt = (x, z) => {
+  const a = Math.atan2(z, x);
+  return 120 + 120 * fbm(Math.cos(a) * 1.3 + 5, Math.sin(a) * 1.3 + 7, 3);
+};
 
 function terrainH(x, z) {
-  const d = -z, ax = Math.abs(x), edge = edgeW(d), s = Math.max(0, ax - edge);
-  const amp = 38 + 0.12 * clamp(d, 0, 900);
-  let h = (1 - Math.exp(-s * 0.008)) * amp;                                            // rolling side hills
-  h += (fbm(x * 0.004 + 11, z * 0.004 + 5, 4) - 0.45) * 50 * smoothstep(15, 260, s);   // ridges on the slopes
+  const r = Math.hypot(x, z), s = Math.max(0, r - edgeAt(x, z));
+  const amp = 25 + 0.07 * Math.min(r, 900);
+  let h = (1 - Math.exp(-s * 0.008)) * amp;                                             // rolling hills all around
+  h += (fbm(x * 0.004 + 11, z * 0.004 + 5, 4) - 0.45) * 50 * smoothstep(15, 260, s);    // ridges on the slopes
   h += (fbm(x * 0.02 + 2, z * 0.02 + 8, 3) - 0.45) * 2.2 * (1 - smoothstep(0, 120, s)); // gentle meadow undulation
-  h += smoothstep(250, 1150, d) * (40 + 60 * fbm(x * 0.003 + 40, z * 0.003 + 1, 3)) *
-       (0.20 + 0.80 * smoothstep(0, 450, ax));                                         // low back hills, valley stays open
+  h += smoothstep(250, 1150, r) * (30 + 45 * fbm(x * 0.003 + 40, z * 0.003 + 1, 3)) * 0.6;  // low back hills
   return h;
 }
 
 // 0..1 "how forested" a spot is (belt along the slopes, thinning above the tree line, with glades).
 function forestMask(x, z, h) {
-  const d = -z, edge = edgeW(d), s = Math.max(0, Math.abs(x) - edge);
+  const r = Math.hypot(x, z), s = Math.max(0, r - edgeAt(x, z));
   const belt = smoothstep(3, 28, s);
-  const back = smoothstep(30, 90, h) * smoothstep(300, 700, d);
+  const back = smoothstep(30, 90, h) * smoothstep(300, 700, r);
   const line = 1 - smoothstep(105, 150, h);
   const patch = smoothstep(0.34, 0.52, fbm(x * 0.005 + 3, z * 0.005 + 9, 3));
   return clamp(Math.max(belt, back) * line * (0.45 + 0.55 * patch), 0, 1);
@@ -273,34 +287,34 @@ const addInst = (g, name, arr, size) => g.setAttribute(name, new THREE.Instanced
 /* ==========================================================================
    6. FAR MOUNTAIN RANGES (snow patches, atmospheric perspective)
    ========================================================================== */
-function mountainH(x, z, zc, layer) {
+function mountainH(x, z, rc, layer) {
   const s = layer ? 31.7 : 0, f = 0.00085;
   let a = 0.55, fr = f, sum = 0;
   for (let i = 0; i < 5; i++) {
     const n = 1 - Math.abs(2 * vnoise(x * fr + s + 5.3 * i, z * fr + s * 0.7) - 1);   // ridged noise = sharp crests
     sum += a * n * n; fr *= 2.07; a *= 0.48;
   }
-  const env = 0.55 + 0.9 * (fbm(x * 0.00045 + s, 0.5 + s, 3) - 0.3);
-  const edge = 1 - smoothstep(3000, 4200, Math.abs(x));
-  const frac = (zc + 450 - z) / 900;                                                  // 0 front .. 1 back
+  const env = 0.55 + 0.9 * (fbm(x * 0.00045 + s, z * 0.00045 + 0.5 + s, 3) - 0.3);
+  const frac = (Math.hypot(x, z) - (rc - 450)) / 900;                                 // 0 inner edge .. 1 outer edge
   const depth = smoothstep(0.0, 0.5, frac) * (1 - 0.35 * smoothstep(0.75, 1, frac));
-  return sum * (layer ? 980 : 820) * clamp(env, 0.3, 1.3) * edge * depth;
+  return sum * (layer ? 980 : 820) * clamp(env, 0.45, 1.3) * depth;
 }
 
-function buildMountains(zc, layer, boost) {
-  const [NX, NZ] = Q.mtn, vc = (NX + 1) * (NZ + 1);
+// A full ring of peaks (radius rc +/- 450 m) so the range surrounds the viewer in every direction.
+function buildMountains(rc, layer, boost) {
+  const NA = Math.round(Q.mtn[0] * 2), NR = Q.mtn[1], vc = NA * (NR + 1);
   const pos = new Float32Array(vc * 3), col = new Float32Array(vc * 3);
   let k = 0;
-  for (let j = 0; j <= NZ; j++) {
-    const z = zc + 450 - (j / NZ) * 900;
-    for (let i = 0; i <= NX; i++) {
-      const x = (i / NX * 2 - 1) * 4200;
-      pos[k++] = x; pos[k++] = mountainH(x, z, zc, layer); pos[k++] = z;
+  for (let j = 0; j <= NR; j++) {
+    const r = rc - 450 + (j / NR) * 900;
+    for (let i = 0; i < NA; i++) {
+      const a = i / NA * Math.PI * 2, x = Math.cos(a) * r, z = Math.sin(a) * r;
+      pos[k++] = x; pos[k++] = mountainH(x, z, rc, layer); pos[k++] = z;
     }
   }
   const idx = [];
-  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++) {
-    const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1;
+  for (let j = 0; j < NR; j++) for (let i = 0; i < NA; i++) {
+    const a = j * NA + i, b = j * NA + (i + 1) % NA, c = a + NA, d = b + NA;   // wraps around: no seam
     idx.push(a, b, c, b, d, c);
   }
   const geo = new THREE.BufferGeometry();
@@ -343,21 +357,21 @@ function buildMountains(zc, layer, boost) {
    7. TERRAIN: meadow floor + rolling hills (shader-painted: grass, flower speckle, forest, rock)
    ========================================================================== */
 function buildTerrain() {
-  const [NX, NZ] = Q.terrain, vc = (NX + 1) * (NZ + 1);
+  const [NA, NR] = Q.terrain, vc = NA * (NR + 1), RMAX = 1600;
   const pos = new Float32Array(vc * 3), forest = new Float32Array(vc);
   let k = 0, f = 0;
-  for (let j = 0; j <= NZ; j++) {
-    const z = 40 - Math.pow(j / NZ, 2) * 1560;                 // dense near the camera, sparse far away
-    for (let i = 0; i <= NX; i++) {
-      const u = i / NX * 2 - 1, x = Math.sign(u) * u * u * 2400;
+  for (let j = 0; j <= NR; j++) {
+    const r = Math.pow(j / NR, 2) * RMAX;                      // rings: dense near the viewer, sparse far away
+    for (let i = 0; i < NA; i++) {
+      const a = i / NA * Math.PI * 2, x = Math.cos(a) * r, z = Math.sin(a) * r;
       const h = terrainH(x, z);
       pos[k++] = x; pos[k++] = h; pos[k++] = z; forest[f++] = forestMask(x, z, h);
     }
   }
-  const idx = vc > 65535 ? new Uint32Array(NX * NZ * 6) : new Uint16Array(NX * NZ * 6);
+  const idx = vc > 65535 ? new Uint32Array(NA * NR * 6) : new Uint16Array(NA * NR * 6);
   let q = 0;
-  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++) {
-    const a = j * (NX + 1) + i, b = a + 1, c = a + NX + 1, d = c + 1;
+  for (let j = 0; j < NR; j++) for (let i = 0; i < NA; i++) {
+    const a = j * NA + i, b = j * NA + (i + 1) % NA, c = a + NA, d = b + NA;   // wraps around: no seam
     idx[q++] = a; idx[q++] = b; idx[q++] = c; idx[q++] = b; idx[q++] = d; idx[q++] = c;
   }
   const geo = new THREE.BufferGeometry();
@@ -446,10 +460,12 @@ function buildForest() {
   let n = 0, tries = 0;
   while (n < N && tries < N * 60) {
     tries++;
-    const d = 6 + 1250 * Math.pow(rand(), 2.2), z = -d, edge = edgeW(d);
-    const x = rand() < 0.85
-      ? (rand() < 0.5 ? -1 : 1) * (edge + (-Math.log(rand() + 1e-4)) * 160 * (0.4 + d / 900))
-      : (rand() - 0.5) * 2 * (300 + d * 0.5);
+    const a = rand() * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a), e = edgeAt(ca, sa);
+    const d = rand() < 0.85
+      ? e + (-Math.log(rand() + 1e-4)) * 150 * (0.5 + e / 600)       // dense belt hugging the slopes
+      : 20 + 1300 * Math.pow(rand(), 1.6);                           // plus scattered stands further out
+    if (d > 1450) continue;
+    const x = ca * d, z = sa * d;
     const h = terrainH(x, z), m = forestMask(x, z, h);
     if (rand() > m * m * 1.1) continue;
     const ht = (8 + rand() * 9) * (1 + d / 650);                       // far trees a bit larger to hide gaps
@@ -502,13 +518,12 @@ function buildGrass() {
   const N = Q.grass;
   const off = new Float32Array(N * 3), shape = new Float32Array(N * 4), lean = new Float32Array(N * 2), tint = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    const dd = Math.pow(rand(), 2.3) * 95;                      // far more blades near the camera
-    const z = 4.4 - dd, hw = 1.1 * (7 - z) + 5;
-    const x = (rand() * 2 - 1) * hw;
+    const dd = Math.pow(rand(), 2.3) * 95, ang = rand() * Math.PI * 2;   // far more blades near the viewer, all around
+    const x = Math.cos(ang) * dd, z = Math.sin(ang) * dd;
     const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
     off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
     shape[i * 4]     = (0.30 + rand() * 0.34) * (0.8 + 0.55 * patch);              // height
-    shape[i * 4 + 1] = (0.032 + rand() * 0.026) * (1 + (7 - z) * 0.02);            // width (wider far away => no shimmer)
+    shape[i * 4 + 1] = (0.032 + rand() * 0.026) * (1 + dd * 0.02);            // width (wider far away => no shimmer)
     shape[i * 4 + 2] = rand() * Math.PI;                                           // yaw
     shape[i * 4 + 3] = rand();                                                     // phase
     const la = rand() * Math.PI * 2, lm = 0.04 + rand() * 0.16;
@@ -589,8 +604,8 @@ function buildFlowers() {
   const N = Q.flowers;
   const off = new Float32Array(N * 3), prm = new Float32Array(N * 4), tint = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    const dd = Math.pow(rand(), 2.0) * 90;
-    const z = 4.4 - dd, hw = 1.1 * (7 - z) + 5, x = (rand() * 2 - 1) * hw;
+    const dd = Math.pow(rand(), 2.0) * 90, ang = rand() * Math.PI * 2;
+    const x = Math.cos(ang) * dd, z = Math.sin(ang) * dd;
     const patch = vnoise(x * 0.1 + 3, z * 0.1 + 9);
     off[i * 3] = x; off[i * 3 + 1] = terrainH(x, z); off[i * 3 + 2] = z;
     prm[i * 4]     = (0.36 + rand() * 0.38) * (0.85 + 0.4 * patch);   // stem height
@@ -623,7 +638,8 @@ function buildFlowers() {
       } else {
         float a = aParam.z * 6.2831;
         // heads face up and toward the viewer, and nod with the wind
-        vec3 N = normalize(vec3(sin(a)*0.45 + w.x*0.12, 1.0, 0.7 + cos(a)*0.35 + w.y*0.12));
+        vec2 toCam = normalize(cameraPosition.xz - P + vec2(0.0001));
+        vec3 N = normalize(vec3(toCam.x*0.7 + sin(a)*0.35 + w.x*0.12, 1.0, toCam.y*0.7 + cos(a)*0.35 + w.y*0.12));
         vec3 T = normalize(cross(vec3(0.0, 1.0, 0.0), N));
         vec3 B = cross(N, T);
         float dist = length(stem - cameraPosition);
@@ -679,7 +695,7 @@ function buildParticles() {
       p.y  += sin(uTime*(0.4 + aSeed.w*0.5) + aSeed.x*20.0) * 0.5;
       p.x  += sin(uTime*0.7 + aSeed.x*30.0) * 0.35; p.z += cos(uTime*0.6 + aSeed.x*17.0) * 0.35;
       p = mod(p, box);
-      vec3 wp = vec3(p.x - 35.0, p.y + 0.15, 6.0 - p.z);
+      vec3 wp = vec3(p.x - 35.0, p.y + 0.15, p.z - 55.0);
       vec4 mv = viewMatrix * vec4(wp, 1.0);
       gl_Position = projectionMatrix * mv;
       float dist = -mv.z;
@@ -719,7 +735,7 @@ function buildBirds() {
   base.setIndex([0, 2, 3,  2, 1, 3,  4, 5, 6,  7, 9, 8]);
   const N = Q.birds, ctr = new Float32Array(N * 3), orb = new Float32Array(N * 3), sz = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    ctr[i * 3] = (rand() - 0.5) * 360; ctr[i * 3 + 1] = 55 + rand() * 90; ctr[i * 3 + 2] = -(170 + rand() * 260);
+    { const ba = rand() * Math.PI * 2, br = 170 + rand() * 260; ctr[i * 3] = Math.cos(ba) * br; ctr[i * 3 + 1] = 55 + rand() * 90; ctr[i * 3 + 2] = Math.sin(ba) * br; }
     orb[i * 3] = 40 + rand() * 60; orb[i * 3 + 1] = (0.10 + rand() * 0.10) * (rand() < 0.5 ? -1 : 1); orb[i * 3 + 2] = rand() * 6.28;
     sz[i] = 3.2 + rand() * 2.2;
   }
@@ -769,7 +785,7 @@ function buildButterflies() {
   const pal = [[0.98, 0.78, 0.10], [0.96, 0.96, 0.92], [0.95, 0.45, 0.12], [0.45, 0.65, 0.95], [0.9, 0.9, 0.35]];
   const N = Q.butterflies, bs = new Float32Array(N * 3), sd = new Float32Array(N * 4), cl = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) {
-    bs[i * 3] = (rand() - 0.5) * 26; bs[i * 3 + 1] = 0.55 + rand() * 0.8; bs[i * 3 + 2] = 1 - rand() * 26;
+    { const ba = rand() * Math.PI * 2, br = 2 + rand() * 18; bs[i * 3] = Math.cos(ba) * br; bs[i * 3 + 1] = 0.55 + rand() * 0.8; bs[i * 3 + 2] = Math.sin(ba) * br; }
     sd[i * 4] = rand(); sd[i * 4 + 1] = 0.7 + rand() * 0.6; sd[i * 4 + 2] = 0.050 + rand() * 0.030; sd[i * 4 + 3] = rand();
     const c = pal[i % pal.length]; cl[i * 3] = c[0]; cl[i * 3 + 1] = c[1]; cl[i * 3 + 2] = c[2];
   }
@@ -1000,8 +1016,8 @@ camera.rotation.order = 'YXZ';
 // Depth layers, back to front: sky dome -> far mountains -> mid hills + forest -> meadow -> grass + flowers.
 const layers = {
   sky:        buildSky(),
-  farMtns:    buildMountains(-2700, 1, 1.05),
-  nearMtns:   buildMountains(-1650, 0, 0.8),
+  farMtns:    buildMountains(2700, 1, 1.05),
+  nearMtns:   buildMountains(1650, 0, 0.8),
   terrain:    buildTerrain(),
   forest:     buildForest(),
   grass:      buildGrass(),
@@ -1197,27 +1213,72 @@ function adaptQuality(dt) {
 }
 
 /* ==========================================================================
-   20. INTERACTION: very subtle pointer / touch parallax (a couple of degrees)
+   20. INTERACTION: free 360-degree look-around (drag / swipe / arrow keys) and zoom from
+       first-person out to an orbit view around `view.target` (the panda, later)
    ========================================================================== */
-const pointer = { x: 0, y: 0, sx: 0, sy: 0 };
-function onPointer(e) {
-  const t = e.touches && e.touches[0] ? e.touches[0] : e;
-  pointer.x = clamp((t.clientX / innerWidth) * 2 - 1, -1, 1);
-  pointer.y = clamp((t.clientY / innerHeight) * 2 - 1, -1, 1);
-}
-addEventListener('pointermove', onPointer, { passive: true });
-addEventListener('touchmove', onPointer, { passive: true });
-document.addEventListener('mouseleave', () => { pointer.x = pointer.y = 0; });
+const view = {
+  yaw: 0, pitch: CAM_PITCH,            // radians; yaw 0 faces -z, positive turns left
+  dist: 0, distT: 0,                   // 0 = first-person; > 0 orbits the target from behind
+  yawV: 0,                             // inertia after a drag (rad/s)
+  target: new THREE.Vector3(CAM_POS.x, CAM_POS.y, CAM_POS.z)
+};
+const DIST_MAX = 14;
+const ptrs = new Map(); let pinchD = 0, dragging = false;
+const keysLook = {};
+const hintEl = document.getElementById('hint');
+setTimeout(() => hintEl.classList.add('show'), 2200);
+let hintGone = false;
+function dismissHint() { if (hintGone) return; hintGone = true; hintEl.classList.remove('show'); hintEl.classList.add('gone'); }
+setTimeout(dismissHint, 10000);
 
-const PARALLAX_YAW = THREE.MathUtils.degToRad(2.2), PARALLAX_PITCH = THREE.MathUtils.degToRad(1.1);
+const pinchDist = () => { const a = [...ptrs.values()]; return a.length < 2 ? 0 : Math.hypot(a[0][0] - a[1][0], a[0][1] - a[1][1]); };
+canvas.addEventListener('pointerdown', e => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  ptrs.set(e.pointerId, [e.clientX, e.clientY, e.timeStamp]);
+  pinchD = pinchDist(); dragging = true; view.yawV = 0; canvas.classList.add('drag'); dismissHint();
+});
+canvas.addEventListener('pointermove', e => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  const dx = e.clientX - p[0], dy = e.clientY - p[1], dt = Math.max(0.008, (e.timeStamp - p[2]) / 1000);
+  p[0] = e.clientX; p[1] = e.clientY; p[2] = e.timeStamp;
+  if (ptrs.size === 1) {
+    const sens = 0.0042 * (camera.fov / 50);                      // "grab the world" feel at any field of view
+    view.yaw += dx * sens; view.pitch += dy * sens * 0.85;
+    view.yawV += (dx * sens / dt - view.yawV) * 0.4;
+  } else if (ptrs.size === 2) {
+    const d = pinchDist(); view.distT = clamp(view.distT - (d - pinchD) * 0.03, 0, DIST_MAX); pinchD = d;
+  }
+});
+const endPtr = e => {
+  ptrs.delete(e.pointerId); pinchD = pinchDist();
+  if (!ptrs.size) { dragging = false; canvas.classList.remove('drag'); }
+};
+canvas.addEventListener('pointerup', endPtr);
+canvas.addEventListener('pointercancel', endPtr);
+canvas.addEventListener('wheel', e => {
+  view.distT = clamp(view.distT + e.deltaY * 0.012, 0, DIST_MAX); dismissHint(); e.preventDefault();
+}, { passive: false });
+addEventListener('keydown', e => { if (e.key.startsWith('Arrow')) { keysLook[e.key] = 1; dismissHint(); e.preventDefault(); } });
+addEventListener('keyup', e => { keysLook[e.key] = 0; });
+
 function updateCamera(rdt, t) {
-  const k = 1 - Math.exp(-rdt * 2.6);
-  pointer.sx += (pointer.x - pointer.sx) * k;
-  pointer.sy += (pointer.y - pointer.sy) * k;
-  const m = reduceMotion ? 0.4 : 1;
-  const sway = Math.sin(t * 0.21) * 0.0016 + Math.sin(t * 0.37 + 2.0) * 0.0009 * (1 + wind.effective);  // faint breathing
-  camera.position.set(CAM_POS.x + pointer.sx * 0.22 * m, CAM_POS.y - pointer.sy * 0.04 * m, CAM_POS.z);
-  camera.rotation.set(CAM_PITCH - pointer.sy * PARALLAX_PITCH * m + sway, -pointer.sx * PARALLAX_YAW * m, 0);
+  if (!dragging) {                                                  // gentle inertia after letting go
+    view.yaw += view.yawV * rdt; view.yawV *= Math.exp(-rdt * 3.2);
+    if (Math.abs(view.yawV) < 1e-3) view.yawV = 0;
+  }
+  view.yaw   += ((keysLook.ArrowLeft ? 1 : 0) - (keysLook.ArrowRight ? 1 : 0)) * 1.4 * rdt;
+  view.pitch += ((keysLook.ArrowUp ? 1 : 0) - (keysLook.ArrowDown ? 1 : 0)) * 0.9 * rdt;
+  view.dist += (view.distT - view.dist) * (1 - Math.exp(-rdt * 6));
+  const pMax = mix(1.25, 0.35, smoothstep(0.3, 4.0, view.dist));  // orbiting low from underneath makes no sense
+  view.pitch = clamp(view.pitch, -1.2, pMax);
+
+  const sway = (Math.sin(t * 0.21) * 0.0016 + Math.sin(t * 0.37 + 2.0) * 0.0009 * (1 + wind.effective)) * (reduceMotion ? 0.4 : 1);
+  const cp = Math.cos(view.pitch);
+  const fx = -Math.sin(view.yaw) * cp, fy = Math.sin(view.pitch), fz = -Math.cos(view.yaw) * cp;   // look direction
+  const px = view.target.x - fx * view.dist, pz = view.target.z - fz * view.dist;
+  const py = Math.max(view.target.y - fy * view.dist, terrainH(px, pz) + 0.55);                     // stay above the ground
+  camera.position.set(px, py, pz);
+  camera.rotation.set(view.pitch + sway, view.yaw, 0);
 }
 
 /* ==========================================================================
@@ -1246,6 +1307,11 @@ const sceneAPI = {
     frameCallbacks.push(cb);
     return () => { const i = frameCallbacks.indexOf(cb); if (i >= 0) frameCallbacks.splice(i, 1); };
   },
+  /** Camera rig: { yaw, pitch, dist, distT, target:Vector3 }. Move `target` to make the camera follow something. */
+  view,
+  setView(o) { if (!o) return; ['yaw', 'pitch'].forEach(k => { if (k in o) view[k] = Number(o[k]); }); if ('dist' in o) view.dist = view.distT = clamp(Number(o.dist), 0, DIST_MAX); },
+  /** Ground height at world (x, z). */
+  getGroundHeight: terrainH,
   // Handy escape hatches for later components that want to share the same GL context / camera.
   THREE, scene, camera, renderer
 };
